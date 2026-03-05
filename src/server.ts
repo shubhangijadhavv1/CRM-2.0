@@ -40,7 +40,7 @@ const httpServer = createServer(app);
 // In localhost dev, this still works (req.ip will be 127.0.0.1/::1).
 app.set('trust proxy', true);
 
-app.use(helmet());
+
 app.use(express.json({ limit: '10mb' }));
 
 const clientOrigin = process.env.CLIENT_ORIGIN || 'http://127.0.0.1:5174';
@@ -73,9 +73,10 @@ app.use(
     credentials: true
   }),
   helmet({
-    // Disable CSP so Tailwind CDN and inline scripts in index.html work.
-    // (Do NOT call helmet() again later with defaults or it will re-enable CSP.)
-    contentSecurityPolicy: false,
+      contentSecurityPolicy: false,
+    crossOriginEmbedderPolicy: false,
+    crossOriginOpenerPolicy: false,
+    originAgentCluster: false
   })
 );
 
@@ -84,8 +85,8 @@ const __dirname = path.dirname(__filename);
 const buildPath = path.resolve(__dirname, 'dist');
 app.use(express.static(buildPath));
 
-app.set('trust proxy', true);
-app.use(express.json({ limit: '1mb' }));
+
+
 
 
 
