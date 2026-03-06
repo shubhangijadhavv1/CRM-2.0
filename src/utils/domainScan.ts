@@ -705,7 +705,7 @@ export async function checkDomainLive(domainInput: string): Promise<DomainStatus
     const timeout = setTimeout(() => controller.abort(), 30000); // 30 second timeout
 
     try {
-      console.log(`[DomainCheck] Checking: ${tryUrl}`);
+      
       
       const res = await fetch(tryUrl, {
         method: 'GET',
@@ -718,7 +718,6 @@ export async function checkDomainLive(domainInput: string): Promise<DomainStatus
       const responseTime = Date.now() - startTime;
       const finalUrl = res.url;
       
-      console.log(`[DomainCheck] Got response: ${res.status} from ${finalUrl} in ${responseTime}ms`);
       
       // ANY response from server means the domain is reachable
       // Only check for parking if we got HTML content
@@ -756,7 +755,7 @@ export async function checkDomainLive(domainInput: string): Promise<DomainStatus
         }
       } catch (readErr) {
         // Can't read body but server responded - it's live
-        console.log(`[DomainCheck] Could not read body, but server responded - marking as live`);
+        // console.log(`[DomainCheck] Could not read body, but server responded - marking as live`);
         return { isLive: true, isParked: false, statusCode: res.status, responseTime };
       }
       

@@ -185,6 +185,7 @@ async function validateUserIpForTeamOnly(user: any, req: any): Promise<string | 
   const ip = getClientIp(req);
   const userAllow = Array.isArray((user as any).allowedIps) ? (user as any).allowedIps : [];
   const normalizedUserAllow = userAllow.map((s: any) => String(s).trim()).filter(Boolean);
+
   if (normalizedUserAllow.length > 0 && !normalizedUserAllow.includes(ip)) {
     return `Login blocked: Your IP (${ip}) is not whitelisted. Contact Super Admin to add your IP.`;
   }
