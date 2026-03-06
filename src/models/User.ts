@@ -50,6 +50,9 @@ export interface UserDoc {
   // Desktop agent: explicit login/logout for real-time CRM display
   lastAgentLoginAt?: Date;
   lastAgentLogoutAt?: Date;
+  twoFactorEnabled?: boolean;
+  twoFactorSecret?: string;
+  twoFactorEnabledAt?: Date | null;
 }
 
 const UserSchema = new Schema<UserDoc>(
@@ -102,10 +105,12 @@ const UserSchema = new Schema<UserDoc>(
     browserCrmOrigin: { type: String, default: '' },
     browserExtensionVersion: { type: String, default: '' },
     lastAgentLoginAt: { type: Date, default: null },
-    lastAgentLogoutAt: { type: Date, default: null }
+    lastAgentLogoutAt: { type: Date, default: null },
+    twoFactorEnabled: { type: Boolean, default: false },
+    twoFactorSecret: { type: String, default: '' },
+    twoFactorEnabledAt: { type: Date, default: null }
   },
   { timestamps: true }
 );
 
 export const UserModel = mongoose.model<UserDoc>('User', UserSchema);
-

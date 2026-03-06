@@ -17,6 +17,7 @@ function toSafeUser(doc: any) {
   delete u._id;
   delete u.__v;
   delete u.passwordHash;
+  delete u.twoFactorSecret;
   // Serialize Date fields to ISO strings for JSON consistency
   const dateFields = ['lastBrowserActivityAt', 'lastBrowserHeartbeatAt', 'lastAgentLoginAt', 'lastAgentLogoutAt', 'createdAt', 'updatedAt'];
   dateFields.forEach(field => {
@@ -142,6 +143,20 @@ usersRouter.put('/:id', async (req: AuthedRequest, res, next) => {
     delete patch.id;
     delete patch._id;
 
+    // Reset 2FA for team users (admin/super-admin only)
+    if (patch.resetTwoFactor) {
+      if (req.user!.role !== 'super-admin' && req.user!.role !== 'admin') {
+        return res.status(403).json({ error: 'Only admin/super-admin can reset 2FA' });
+      }
+      if (existing.role !== 'team') {
+        return res.status(400).json({ error: '2FA reset is only allowed for team users' });
+      }
+      patch.twoFactorEnabled = false;
+      patch.twoFactorSecret = '';
+      patch.twoFactorEnabledAt = null;
+    }
+    delete patch.resetTwoFactor;
+
     // Password update
     if (patch.password) {
       if (String(patch.password).length < 6) return res.status(400).json({ error: 'password must be at least 6 characters' });
@@ -203,4 +218,3 @@ usersRouter.delete('/:id', async (req: AuthedRequest, res, next) => {
     return next(e);
   }
 });
-

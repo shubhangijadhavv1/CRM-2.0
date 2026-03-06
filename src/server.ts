@@ -4,6 +4,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
 import path from 'node:path';
+import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:http';
 import { connectMongo } from './config/db.js';
@@ -85,6 +86,67 @@ const __dirname = path.dirname(__filename);
 const buildPath = path.resolve(__dirname, 'dist');
 app.use(express.static(buildPath));
 
+const downloadDirectories = [
+  process.env.DOWNLOADS_DIR,
+  path.resolve(process.cwd(), 'public', 'downloads'),
+  path.resolve(process.cwd(), 'desktop-agent', 'release'),
+  path.resolve(process.cwd(), '..', 'desktop-agent', 'release'),
+  path.resolve(__dirname, '..', 'desktop-agent', 'release'),
+  path.resolve(__dirname, '..', '..', 'desktop-agent', 'release')
+].filter((value): value is string => Boolean(value));
+
+function pickLatestFile(regex: RegExp, preferredNameRegex?: RegExp) {
+  const matches: { fullPath: string; fileName: string; mtimeMs: number }[] = [];
+  for (const dir of downloadDirectories) {
+    if (!fs.existsSync(dir)) continue;
+    let entries: fs.Dirent[] = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      if (!regex.test(entry.name)) continue;
+      const fullPath = path.join(dir, entry.name);
+      let stat: fs.Stats;
+      try {
+        stat = fs.statSync(fullPath);
+      } catch {
+        continue;
+      }
+      matches.push({ fullPath, fileName: entry.name, mtimeMs: stat.mtimeMs });
+    }
+  }
+
+  if (!matches.length) return null;
+  const preferred = preferredNameRegex
+    ? matches.filter((item) => preferredNameRegex.test(item.fileName))
+    : matches;
+  const source = preferred.length ? preferred : matches;
+  source.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return source[0];
+}
+
+app.get('/api/downloads/mac', (_req, res) => {
+  const externalUrl = process.env.DOWNLOAD_MAC_URL?.trim();
+  if (externalUrl) return res.redirect(externalUrl);
+
+  const file = pickLatestFile(/\.dmg$/i, /nexus|agent|crm/i);
+  if (!file) return res.status(404).json({ error: 'Mac installer not found on server.' });
+  return res.download(file.fullPath, file.fileName);
+});
+
+app.get('/api/downloads/windows', (_req, res) => {
+  const externalUrl = process.env.DOWNLOAD_WINDOWS_URL?.trim();
+  if (externalUrl) return res.redirect(externalUrl);
+
+  const file = pickLatestFile(/\.exe$/i, /setup|nexus|agent|crm/i);
+  if (!file) return res.status(404).json({ error: 'Windows installer not found on server.' });
+  return res.download(file.fullPath, file.fileName);
+});
+
 
 
 
@@ -153,4 +215,3 @@ start().catch((err) => {
   console.error('[api] failed to start', err);
   process.exit(1);
 });
-

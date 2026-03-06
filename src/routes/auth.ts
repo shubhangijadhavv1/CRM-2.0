@@ -1,13 +1,32 @@
 import { Router } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import speakeasy from 'speakeasy';
+import qrcode from 'qrcode';
+import { randomBytes } from 'node:crypto';
+import { isIP } from 'node:net';
 import { UserModel } from '../models/User.js';
-import { BranchConfigModel } from '../models/BranchConfig.js';
 import { requireAuth, requireRole, type AuthedRequest } from '../middleware/auth.js';
 import { requireDb } from '../middleware/db.js';
 import { emitInvalidate } from '../realtime/invalidate.js';
 
 export const authRouter = Router();
+
+type PendingTwoFactorSetup = {
+  secret: string;
+  expiresAt: number;
+};
+
+type VerifiedLoginTicket = {
+  userId: string;
+  email: string;
+  expiresAt: number;
+};
+
+const pendingTwoFactorSetups = new Map<string, PendingTwoFactorSetup>();
+const verifiedLoginTickets = new Map<string, VerifiedLoginTicket>();
+const PENDING_SETUP_TTL_MS = 10 * 60 * 1000;
+const LOGIN_TICKET_TTL_MS = 10 * 60 * 1000;
 
 /** Build a JSON-serializable user object (dates → ISO strings) so login/me never throw on res.json(). */
 function toSafeUser(user: any): Record<string, unknown> {
@@ -41,6 +60,8 @@ function toSafeUser(user: any): Record<string, unknown> {
     browserExtensionVersion: u.browserExtensionVersion,
     lastAgentLoginAt: u.lastAgentLoginAt instanceof Date ? u.lastAgentLoginAt.toISOString() : u.lastAgentLoginAt,
     lastAgentLogoutAt: u.lastAgentLogoutAt instanceof Date ? u.lastAgentLogoutAt.toISOString() : u.lastAgentLogoutAt,
+    twoFactorEnabled: Boolean(u.twoFactorEnabled),
+    twoFactorEnabledAt: u.twoFactorEnabledAt instanceof Date ? u.twoFactorEnabledAt.toISOString() : u.twoFactorEnabledAt,
   };
   return Object.fromEntries(Object.entries(out).filter(([, v]) => v !== undefined));
 }
@@ -51,22 +72,239 @@ function signToken(userId: string, role: string) {
   return jwt.sign({ role }, secret, { subject: userId, expiresIn: '7d' });
 }
 
-function getClientIp(req: any) {
-  const xff = req.headers?.['x-forwarded-for'];
-  const raw = Array.isArray(xff) ? xff[0] : String(xff || '');
-  const ip = (raw.split(',')[0]?.trim() || req.ip || '').trim();
-  return ip.startsWith('::ffff:') ? ip.slice(7) : ip;
+function normalizeIpToken(value: unknown): string {
+  const raw = String(value || '').trim();
+  if (!raw || raw.toLowerCase() === 'unknown') return '';
+
+  // Handle comma-separated proxy chains (x-forwarded-for)
+  const first = raw.split(',')[0]?.trim() || '';
+  if (!first) return '';
+
+  // Strip IPv4 port, e.g. "1.2.3.4:53124"
+  let candidate = first;
+  if (candidate.includes('.') && candidate.includes(':') && !candidate.includes('::')) {
+    candidate = candidate.split(':')[0].trim();
+  }
+
+  // Handle bracketed IPv6 with optional port, e.g. "[2001:db8::1]:443"
+  if (candidate.startsWith('[') && candidate.includes(']')) {
+    candidate = candidate.slice(1, candidate.indexOf(']')).trim();
+  }
+
+  // Convert IPv4-mapped IPv6, e.g. "::ffff:110.225.251.134"
+  if (candidate.startsWith('::ffff:')) candidate = candidate.slice(7);
+
+  // Normalize localhost IPv6 token
+  if (candidate === '::1') candidate = '127.0.0.1';
+
+  return isIP(candidate) ? candidate : '';
 }
 
-authRouter.post('/login', requireDb, async (req, res, next) => {
+function getClientIp(req: any) {
+  const headers = req.headers || {};
+  const fromCf = normalizeIpToken(headers['cf-connecting-ip']);
+  if (fromCf) return fromCf;
+
+  const fromTrueClient = normalizeIpToken(headers['true-client-ip']);
+  if (fromTrueClient) return fromTrueClient;
+
+  const fromRealIp = normalizeIpToken(headers['x-real-ip']);
+  if (fromRealIp) return fromRealIp;
+
+  const xff = headers['x-forwarded-for'];
+  if (Array.isArray(xff)) {
+    for (const item of xff) {
+      const parsed = normalizeIpToken(item);
+      if (parsed) return parsed;
+    }
+  } else {
+    const parsed = normalizeIpToken(xff);
+    if (parsed) return parsed;
+  }
+
+  return normalizeIpToken(req.ip) || '';
+}
+
+async function validateUserIpForTeamOnly(user: any, req: any): Promise<string | null> {
+  // IP verification only for team users (not super-admin, admin, team-lead)
+  if (user.role !== 'team') return null;
+  const ip = getClientIp(req);
+  const userAllow = Array.isArray((user as any).allowedIps) ? (user as any).allowedIps : [];
+  const normalizedUserAllow = userAllow.map((s: any) => String(s).trim()).filter(Boolean);
+  if (normalizedUserAllow.length > 0 && !normalizedUserAllow.includes(ip)) {
+    return `Login blocked: Your IP (${ip}) is not whitelisted. Contact Super Admin to add your IP.`;
+  }
+  return null;
+}
+
+function normalizeEmail(input: unknown) {
+  return String(input || '').toLowerCase().trim();
+}
+
+function normalizeOtpToken(input: unknown) {
+  return String(input || '').replace(/\s+/g, '').trim();
+}
+
+function cleanupTwoFactorState() {
+  const now = Date.now();
+  for (const [email, item] of pendingTwoFactorSetups.entries()) {
+    if (item.expiresAt <= now) pendingTwoFactorSetups.delete(email);
+  }
+  for (const [ticket, item] of verifiedLoginTickets.entries()) {
+    if (item.expiresAt <= now) verifiedLoginTickets.delete(ticket);
+  }
+}
+
+function issueLoginTicket(userId: string, email: string) {
+  cleanupTwoFactorState();
+  const ticket = randomBytes(24).toString('hex');
+  verifiedLoginTickets.set(ticket, {
+    userId,
+    email,
+    expiresAt: Date.now() + LOGIN_TICKET_TTL_MS
+  });
+  return ticket;
+}
+
+authRouter.post('/2fa/challenge', requireDb, async (req, res) => {
   try {
-    const { email, password } = req.body ?? {};
+    const email = normalizeEmail(req.body?.email);
+    const password = String(req.body?.password || '');
     if (!email || !password) return res.status(400).json({ error: 'Email and password are required' });
 
-    const user = await UserModel.findOne({ email: String(email).toLowerCase().trim() }).lean();
+    const user = await UserModel.findOne({ email }).lean();
     if (!user) return res.status(401).json({ error: 'Invalid email or password.' });
     if (user.status !== 'active') return res.status(403).json({ error: 'Account is inactive.' });
     if (user.loginLocked) return res.status(403).json({ error: 'Login Locked: You have already logged out today. Request Admin for unlock.' });
+
+    const hash = (user as any).passwordHash;
+    if (!hash || typeof hash !== 'string') return res.status(500).json({ error: 'Server misconfiguration: user account missing password. Contact admin.' });
+    const ok = await bcrypt.compare(password, hash);
+    if (!ok) return res.status(401).json({ error: 'Invalid email or password.' });
+
+    const ipError = await validateUserIpForTeamOnly(user, req);
+    if (ipError) return res.status(403).json({ error: ipError });
+
+    const role = String((user as any).role || '');
+    if ((user as any).twoFactorEnabled && (user as any).twoFactorSecret) {
+      return res.json({ requiresSetup: false, role });
+    }
+
+    const generated = speakeasy.generateSecret({
+      name: `GCD-CRM (${email})`
+    });
+
+    pendingTwoFactorSetups.set(email, {
+      secret: generated.base32,
+      expiresAt: Date.now() + PENDING_SETUP_TTL_MS
+    });
+
+    const qrCode = await qrcode.toDataURL(generated.otpauth_url || '');
+    return res.json({
+      requiresSetup: true,
+      role,
+      qrCode,
+      secret: generated.base32
+    });
+  } catch (e: any) {
+    const msg = e?.message && typeof e.message === 'string' ? e.message : 'Failed to initialize 2FA.';
+    return res.status(500).json({ error: msg });
+  }
+});
+
+authRouter.post('/2fa/setup/verify', requireDb, async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body?.email);
+    const token = normalizeOtpToken(req.body?.token);
+    if (!email || !token) return res.status(400).json({ error: 'Email and OTP are required' });
+
+    cleanupTwoFactorState();
+    const pending = pendingTwoFactorSetups.get(email);
+    if (!pending) return res.status(400).json({ error: '2FA setup has expired. Please generate QR again.' });
+
+    const verified = speakeasy.totp.verify({
+      secret: pending.secret,
+      encoding: 'base32',
+      token,
+      window: 1
+    });
+    if (!verified) return res.status(400).json({ error: 'Invalid OTP' });
+
+    const updated = await UserModel.findOneAndUpdate(
+      { email },
+      {
+        $set: {
+          twoFactorEnabled: true,
+          twoFactorSecret: pending.secret,
+          twoFactorEnabledAt: new Date()
+        }
+      },
+      { new: true }
+    ).lean();
+    if (!updated) return res.status(404).json({ error: 'User not found' });
+
+    pendingTwoFactorSetups.delete(email);
+    const loginTicket = issueLoginTicket(String((updated as any)._id), email);
+    return res.json({ verified: true, loginTicket });
+  } catch (e: any) {
+    const msg = e?.message && typeof e.message === 'string' ? e.message : 'Failed to verify OTP.';
+    return res.status(500).json({ error: msg });
+  }
+});
+
+authRouter.post('/2fa/verify', requireDb, async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body?.email);
+    const token = normalizeOtpToken(req.body?.token);
+    if (!email || !token) return res.status(400).json({ error: 'Email and OTP are required' });
+
+    const user = await UserModel.findOne({ email }).lean();
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (!(user as any).twoFactorEnabled || !(user as any).twoFactorSecret) {
+      return res.status(400).json({ error: '2FA is not set up for this account.' });
+    }
+
+    const verified = speakeasy.totp.verify({
+      secret: String((user as any).twoFactorSecret),
+      encoding: 'base32',
+      token,
+      window: 1
+    });
+    if (!verified) return res.status(400).json({ error: 'Invalid OTP' });
+
+    const loginTicket = issueLoginTicket(String((user as any)._id), email);
+    return res.json({ verified: true, loginTicket });
+  } catch (e: any) {
+    const msg = e?.message && typeof e.message === 'string' ? e.message : 'Failed to verify OTP.';
+    return res.status(500).json({ error: msg });
+  }
+});
+
+authRouter.post('/login', requireDb, async (req, res, next) => {
+  try {
+    const { email, password, loginTicket } = req.body ?? {};
+    if (!email || !password) return res.status(400).json({ error: 'Email and password are required' });
+
+    const normalizedEmail = normalizeEmail(email);
+    const user = await UserModel.findOne({ email: normalizedEmail }).lean();
+    if (!user) return res.status(401).json({ error: 'Invalid email or password.' });
+    if (user.status !== 'active') return res.status(403).json({ error: 'Account is inactive.' });
+    if (user.loginLocked) return res.status(403).json({ error: 'Login Locked: You have already logged out today. Request Admin for unlock.' });
+    const role = String((user as any).role || '');
+    const requiresOtpForRole = role === 'admin' || role === 'team';
+    if (requiresOtpForRole) {
+      if (!(user as any).twoFactorEnabled || !(user as any).twoFactorSecret) {
+        return res.status(401).json({ error: '2FA setup is required before login.' });
+      }
+
+      cleanupTwoFactorState();
+      const ticket = typeof loginTicket === 'string' ? loginTicket.trim() : '';
+      const ticketPayload = ticket ? verifiedLoginTickets.get(ticket) : null;
+      if (!ticketPayload || ticketPayload.userId !== String((user as any)._id) || ticketPayload.email !== normalizedEmail) {
+        return res.status(401).json({ error: '2FA verification required before login.' });
+      }
+      verifiedLoginTickets.delete(ticket);
+    }
 
     const hash = (user as any).passwordHash;
     if (!hash || typeof hash !== 'string') return res.status(500).json({ error: 'Server misconfiguration: user account missing password. Contact admin.' });
@@ -74,28 +312,8 @@ authRouter.post('/login', requireDb, async (req, res, next) => {
     const ok = await bcrypt.compare(String(password), hash);
     if (!ok) return res.status(401).json({ error: 'Invalid email or password.' });
 
-    // --- IP restriction (per-user first, then branch allowlist for all non-super-admins) ---
-    if (user.role !== 'super-admin') {
-      const ip = getClientIp(req);
-
-      const userAllow = Array.isArray((user as any).allowedIps) ? (user as any).allowedIps : [];
-      const normalizedUserAllow = userAllow.map((s: any) => String(s).trim()).filter(Boolean);
-      if (normalizedUserAllow.length > 0) {
-        if (!normalizedUserAllow.includes(ip)) {
-          return res.status(403).json({ error: `Login blocked: Your IP (${ip}) is not whitelisted. Contact Super Admin to add your IP.` });
-        }
-      } else {
-        const branchId = (user as any).branch || ((user as any).branches && (user as any).branches[0]) || 'Main';
-        const bc = await BranchConfigModel.findOne({ id: branchId }).lean();
-        const allow = (bc as any)?.ipRestrictions || [];
-        if (Array.isArray(allow) && allow.length > 0) {
-          const normalizedAllow = allow.map((s: any) => String(s).trim()).filter(Boolean);
-          if (!normalizedAllow.includes(ip)) {
-            return res.status(403).json({ error: `Login blocked: Your IP (${ip}) is not whitelisted for branch "${(bc as any)?.name || branchId}". Go to Settings > Branches to add your IP.` });
-          }
-        }
-      }
-    }
+    const ipError = await validateUserIpForTeamOnly(user, req);
+    if (ipError) return res.status(403).json({ error: ipError });
 
     const token = signToken(String(user._id), user.role);
     const safeUser = toSafeUser(user);
@@ -163,4 +381,3 @@ authRouter.put('/me', requireAuth, requireDb, async (req: AuthedRequest, res, ne
     return next(e);
   }
 });
-

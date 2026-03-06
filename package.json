@@ -20,7 +20,9 @@
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.10.0",
     "morgan": "^1.10.0",
+    "qrcode": "^1.5.4",
     "socket.io": "^4.8.3",
+    "speakeasy": "^2.0.0",
     "web-push": "^3.6.7"
   },
   "devDependencies": {
@@ -29,6 +31,8 @@
     "@types/jsonwebtoken": "^9.0.7",
     "@types/morgan": "^1.9.9",
     "@types/node": "^22.14.0",
+    "@types/qrcode": "^1.5.5",
+    "@types/speakeasy": "^2.0.10",
     "@types/web-push": "^3.6.4",
     "tsx": "^4.20.0",
     "typescript": "~5.8.2"

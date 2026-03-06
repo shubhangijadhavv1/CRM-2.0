@@ -52,3 +52,12 @@ notificationsRouter.put('/read-all', async (req: AuthedRequest, res, next) => {
   }
 });
 
+notificationsRouter.delete('/', async (req: AuthedRequest, res, next) => {
+  try {
+    await NotificationModel.deleteMany({ userId: req.user!.id });
+    emitInvalidate('notifications');
+    return res.json({ ok: true });
+  } catch (e) {
+    return next(e);
+  }
+});
