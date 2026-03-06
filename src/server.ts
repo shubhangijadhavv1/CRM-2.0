@@ -88,6 +88,8 @@ app.use(express.static(buildPath));
 
 const downloadDirectories = [
   process.env.DOWNLOADS_DIR,
+  path.resolve(__dirname, 'agent-downloads'),
+  path.resolve(process.cwd(), 'src', 'agent-downloads'),
   path.resolve(process.cwd(), 'public', 'downloads'),
   path.resolve(process.cwd(), 'desktop-agent', 'release'),
   path.resolve(process.cwd(), '..', 'desktop-agent', 'release'),

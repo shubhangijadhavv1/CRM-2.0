@@ -21,6 +21,7 @@ activityRouter.use(requireDb);
 
 const ACTIVITY_LOG_RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const AGENT_HEALTH_MS = 2 * 60 * 1000;
+const idleAlertState = new Map<string, { openSince: string; lastAlertAt: number }>();
 
 function todayStr() {
   return new Date().toISOString().split('T')[0];
@@ -106,19 +107,46 @@ activityRouter.post('/heartbeat', async (req: AuthedRequest, res, next) => {
       status: serverIsIdle ? 'idle' : 'active',
       source: crmOrigin || 'browser'
     }).catch(() => {});
-    if (serverIsIdle) {
+    const attForAlert = await AttendanceModel.findOne({ userId: req.user!.id, date: todayStr(), checkOutTime: null })
+      .sort({ checkInTime: -1 })
+      .lean();
+    const userRole = String((updated as any)?.role || '');
+    const isAdminRole = userRole === 'super-admin' || userRole === 'admin';
+    const isBreakMode = String((attForAlert as any)?.dailyStatus || '').includes('break');
+    const canSendIdleAlert = Boolean(attForAlert) && !isAdminRole && !isBreakMode;
+
+    if (!serverIsIdle) {
+      idleAlertState.delete(req.user!.id);
+    } else if (!canSendIdleAlert) {
+      // Never keep stale alert state for users that should not generate idle alerts.
+      idleAlertState.delete(req.user!.id);
+    } else {
       const policy = await getAgentPolicy();
-      const idleAlertMs = Math.max(1, Number(policy.idleAlertMinutes) || 20) * 60 * 1000;
+      const idleAlertMinutes = Math.max(1, Number(policy.idleAlertMinutes) || 20);
+      const idleAlertMs = idleAlertMinutes * 60 * 1000;
       if (serverIdleForMs >= idleAlertMs) {
-        const user = await UserModel.findById(req.user!.id).select('name').lean();
-        const mins = Math.floor(serverIdleForMs / 60000);
-        await createAdminAlert(
-          'idle-threshold',
-          req.user!.id,
-          `${(user as any)?.name || 'Staff'} is idle for ${mins} minutes.`,
-          `Idle duration crossed threshold (${policy.idleAlertMinutes}m).`,
-          mins >= (Number(policy.idleAlertMinutes) || 20) * 2 ? 'critical' : 'warning'
-        );
+        const openIdle = (attForAlert as any)?.idleIntervals?.find((i: any) => !i.endTime);
+        const openSince = String(openIdle?.startTime || (attForAlert as any)?.checkInTime || '');
+        const nowTs = Date.now();
+        const existing = idleAlertState.get(req.user!.id);
+        const resendMs = 60 * 60 * 1000; // At most once per hour for same idle streak.
+        const shouldAlert =
+          !existing ||
+          existing.openSince !== openSince ||
+          nowTs - existing.lastAlertAt >= resendMs;
+
+        if (shouldAlert) {
+          const user = await UserModel.findById(req.user!.id).select('name').lean();
+          const mins = Math.floor(serverIdleForMs / 60000);
+          await createAdminAlert(
+            'idle-threshold',
+            req.user!.id,
+            `${(user as any)?.name || 'Staff'} is idle for ${mins} minutes.`,
+            `Idle duration crossed threshold (${idleAlertMinutes}m).`,
+            mins >= idleAlertMinutes * 2 ? 'critical' : 'warning'
+          );
+          idleAlertState.set(req.user!.id, { openSince, lastAlertAt: nowTs });
+        }
       }
     }
     await ActivityLogModel.deleteMany({
@@ -130,8 +158,8 @@ activityRouter.post('/heartbeat', async (req: AuthedRequest, res, next) => {
     // --- Update today's attendance live status based on browser-wide activity ---
     // This makes "Idle" visible to admins even when CRM tab isn't open.
     // Only applies to active sessions (checkOutTime is null) and does not override breaks.
-    const todayStr = new Date().toISOString().split('T')[0];
-    const att = await AttendanceModel.findOne({ userId: req.user!.id, date: todayStr, checkOutTime: null })
+    const today = new Date().toISOString().split('T')[0];
+    const att = await AttendanceModel.findOne({ userId: req.user!.id, date: today, checkOutTime: null })
       .sort({ checkInTime: -1 })
       .lean();
 
@@ -618,4 +646,3 @@ activityRouter.get('/logs', requireRole(['admin', 'super-admin']), async (req: A
     return next(e);
   }
 });
-

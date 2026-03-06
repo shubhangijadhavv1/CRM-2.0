@@ -76,12 +76,8 @@ function normalizeIpToken(value: unknown): string {
   const raw = String(value || '').trim();
   if (!raw || raw.toLowerCase() === 'unknown') return '';
 
-  // Handle comma-separated proxy chains (x-forwarded-for)
-  const first = raw.split(',')[0]?.trim() || '';
-  if (!first) return '';
-
   // Strip IPv4 port, e.g. "1.2.3.4:53124"
-  let candidate = first;
+  let candidate = raw;
   if (candidate.includes('.') && candidate.includes(':') && !candidate.includes('::')) {
     candidate = candidate.split(':')[0].trim();
   }
@@ -100,30 +96,88 @@ function normalizeIpToken(value: unknown): string {
   return isIP(candidate) ? candidate : '';
 }
 
-function getClientIp(req: any) {
-  const headers = req.headers || {};
-  const fromCf = normalizeIpToken(headers['cf-connecting-ip']);
-  if (fromCf) return fromCf;
+function parseIpCandidates(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.flatMap((v) => parseIpCandidates(v));
+  }
+  const raw = String(value || '').trim();
+  if (!raw) return [];
+  return raw
+    .split(',')
+    .map((part) => normalizeIpToken(part))
+    .filter(Boolean);
+}
 
-  const fromTrueClient = normalizeIpToken(headers['true-client-ip']);
-  if (fromTrueClient) return fromTrueClient;
+function parseForwardedHeader(value: unknown): string[] {
+  const raw = String(value || '').trim();
+  if (!raw) return [];
+  // RFC 7239 examples: for=203.0.113.195;proto=https;by=203.0.113.43
+  //                    for="[2001:db8:cafe::17]:4711"
+  const matches = raw.match(/for=(?:"?\[?)([^;\],"]+)/gi) || [];
+  return matches
+    .map((m) => m.replace(/^for=/i, '').replace(/^"/, '').replace(/"$/, '').trim())
+    .map((token) => normalizeIpToken(token))
+    .filter(Boolean);
+}
 
-  const fromRealIp = normalizeIpToken(headers['x-real-ip']);
-  if (fromRealIp) return fromRealIp;
+function isPrivateOrLoopbackIp(ip: string): boolean {
+  if (!ip) return true;
+  if (ip === '127.0.0.1' || ip === '0.0.0.0' || ip === '::1') return true;
 
-  const xff = headers['x-forwarded-for'];
-  if (Array.isArray(xff)) {
-    for (const item of xff) {
-      const parsed = normalizeIpToken(item);
-      if (parsed) return parsed;
-    }
-  } else {
-    const parsed = normalizeIpToken(xff);
-    if (parsed) return parsed;
+  // IPv4 private/link-local ranges
+  if (/^10\./.test(ip)) return true;
+  if (/^192\.168\./.test(ip)) return true;
+  if (/^169\.254\./.test(ip)) return true;
+  const m172 = ip.match(/^172\.(\d{1,3})\./);
+  if (m172) {
+    const second = Number(m172[1]);
+    if (second >= 16 && second <= 31) return true;
   }
 
-  return normalizeIpToken(req.ip) || '';
+  // Common local/unique IPv6 prefixes
+  if (/^(fc|fd)/i.test(ip)) return true; // unique local
+  if (/^fe80:/i.test(ip)) return true; // link-local
+
+  return false;
 }
+
+function getClientIp(req: any) {
+  const headers = req.headers || {};
+  const candidates = [
+    ...parseIpCandidates(headers['cf-connecting-ip']),
+    ...parseIpCandidates(headers['true-client-ip']),
+    ...parseForwardedHeader(headers['forwarded']),
+    ...parseIpCandidates(headers['x-forwarded-for']),
+    ...parseIpCandidates(headers['x-client-ip']),
+    ...parseIpCandidates(headers['x-real-ip']),
+    ...parseIpCandidates((req as any).ips),
+    ...parseIpCandidates(req.ip),
+    ...parseIpCandidates(req.socket?.remoteAddress)
+  ];
+
+  const deduped = Array.from(new Set(candidates.filter(Boolean)));
+  const firstPublic = deduped.find((ip) => !isPrivateOrLoopbackIp(ip));
+  if (firstPublic) return firstPublic;
+  return deduped[0] || '';
+}
+
+authRouter.get('/ip-debug', (req, res) => {
+  const headers = req.headers || {};
+  return res.json({
+    resolvedIp: getClientIp(req),
+    reqIp: req.ip || '',
+    reqIps: (req as any).ips || [],
+    socketRemoteAddress: req.socket?.remoteAddress || '',
+    headers: {
+      cfConnectingIp: headers['cf-connecting-ip'] || '',
+      trueClientIp: headers['true-client-ip'] || '',
+      forwarded: headers['forwarded'] || '',
+      xForwardedFor: headers['x-forwarded-for'] || '',
+      xClientIp: headers['x-client-ip'] || '',
+      xRealIp: headers['x-real-ip'] || ''
+    }
+  });
+});
 
 async function validateUserIpForTeamOnly(user: any, req: any): Promise<string | null> {
   // IP verification only for team users (not super-admin, admin, team-lead)
