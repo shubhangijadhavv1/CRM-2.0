@@ -42,3 +42,13 @@ behaviorRouter.post('/', requireRole(['admin', 'super-admin']), async (req, res,
   }
 });
 
+behaviorRouter.delete('/:id', requireRole(['super-admin']), async (req, res, next) => {
+  try {
+    const deleted = await BehaviorModel.findOneAndDelete({ id: req.params.id }).lean();
+    if (!deleted) return res.status(404).json({ error: 'Behavior record not found' });
+    emitInvalidate('behavior');
+    return res.json({ ok: true });
+  } catch (e) {
+    return next(e);
+  }
+});

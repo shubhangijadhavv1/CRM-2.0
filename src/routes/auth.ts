@@ -379,6 +379,37 @@ authRouter.post('/login', requireDb, async (req, res, next) => {
   }
 });
 
+// Desktop agent login endpoint: password-based login without 2FA ticket flow.
+// CRM web login continues to use /login with 2FA where configured.
+authRouter.post('/agent-login', requireDb, async (req, res) => {
+  try {
+    const { email, password } = req.body ?? {};
+    if (!email || !password) return res.status(400).json({ error: 'Email and password are required' });
+
+    const normalizedEmail = normalizeEmail(email);
+    const user = await UserModel.findOne({ email: normalizedEmail }).lean();
+    if (!user) return res.status(401).json({ error: 'Invalid email or password.' });
+    if (user.status !== 'active') return res.status(403).json({ error: 'Account is inactive.' });
+    if (user.loginLocked) return res.status(403).json({ error: 'Login Locked: You have already logged out today. Request Admin for unlock.' });
+
+    const hash = (user as any).passwordHash;
+    if (!hash || typeof hash !== 'string') return res.status(500).json({ error: 'Server misconfiguration: user account missing password. Contact admin.' });
+
+    const ok = await bcrypt.compare(String(password), hash);
+    if (!ok) return res.status(401).json({ error: 'Invalid email or password.' });
+
+    const ipError = await validateUserIpForTeamOnly(user, req);
+    if (ipError) return res.status(403).json({ error: ipError });
+
+    const token = signToken(String(user._id), user.role);
+    const safeUser = toSafeUser(user);
+    return res.json({ token, user: safeUser });
+  } catch (e: any) {
+    const msg = e?.message && typeof e.message === 'string' ? e.message : 'Agent login failed.';
+    return res.status(typeof e?.status === 'number' ? e.status : 500).json({ error: msg });
+  }
+});
+
 authRouter.get('/me', requireAuth, requireDb, async (req: AuthedRequest, res, next) => {
   try {
     const user = await UserModel.findById(req.user!.id).lean();

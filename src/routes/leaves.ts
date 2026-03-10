@@ -122,3 +122,26 @@ leavesRouter.put('/:id', requireRole(['admin', 'super-admin']), async (req, res,
   }
 });
 
+leavesRouter.delete('/:id', async (req: AuthedRequest, res, next) => {
+  try {
+    const existing = await LeaveModel.findOne({ id: req.params.id }).lean();
+    if (!existing) return res.status(404).json({ error: 'Leave not found' });
+
+    const role = req.user?.role;
+    const isAdmin = role === 'admin' || role === 'super-admin';
+    const isOwner = String(existing.userId) === String(req.user?.id);
+
+    if (!isAdmin) {
+      if (!isOwner) return res.status(403).json({ error: 'Forbidden' });
+      if (existing.status !== 'pending') {
+        return res.status(403).json({ error: 'Only pending leave requests can be deleted' });
+      }
+    }
+
+    await LeaveModel.deleteOne({ id: req.params.id });
+    emitInvalidate('leaves');
+    return res.json({ ok: true });
+  } catch (e) {
+    return next(e);
+  }
+});

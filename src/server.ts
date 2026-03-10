@@ -28,6 +28,7 @@ import { activityRouter } from './routes/activity.js';
 import { pushRouter } from './routes/pushSubscription.js';
 import { policyTemplatesRouter } from './routes/policyTemplates.js';
 import { aiRouter } from './routes/ai.js';
+import { migrationsRouter } from './routes/migrations.js';
 import { errorHandler, notFound } from './middleware/error.js';
 import mongoose from 'mongoose';
 import { ensureInitialSuperAdmin } from './config/initialSuperAdmin.js';
@@ -178,6 +179,7 @@ app.use('/api/activity', activityRouter);
 app.use('/api/push', pushRouter);
 app.use('/api/policy-templates', policyTemplatesRouter);
 app.use('/api/ai', aiRouter);
+app.use('/api/migrations', migrationsRouter);
 
 app.use(notFound);
 app.use(errorHandler);

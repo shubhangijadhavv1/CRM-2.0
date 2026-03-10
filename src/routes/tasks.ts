@@ -18,7 +18,7 @@ tasksRouter.get('/', async (req: AuthedRequest, res, next) => {
   try {
     const q: any = {};
     if (req.user?.role === 'team') {
-      q.assigneeId = req.user!.id;
+      q.$or = [{ assigneeId: req.user!.id }, { assignerId: req.user!.id }];
     } else if (req.user?.role === 'admin' || req.user?.role === 'team-lead') {
       const me = await UserModel.findById(req.user.id).lean();
       const branches = getBranchesForUser(me);
@@ -47,10 +47,7 @@ tasksRouter.post('/', async (req: AuthedRequest, res, next) => {
     const data: any = req.body ?? {};
     if (!data.assigneeId) return res.status(400).json({ error: 'assigneeId is required' });
 
-    // Team can only create tasks for themselves
-    if (req.user?.role === 'team' && String(data.assigneeId) !== String(req.user.id)) {
-      return res.status(403).json({ error: 'Staff can only create tasks assigned to themselves' });
-    }
+    // Team members can assign tasks to others; creator still tracked via assignerId.
 
     // Derive assigneeName + branch from user
     const assignee = await UserModel.findById(String(data.assigneeId)).lean();
@@ -95,7 +92,8 @@ tasksRouter.post('/', async (req: AuthedRequest, res, next) => {
       _id: { $ne: req.user!.id },
       status: 'active'
     }).lean();
-    const creatorName = req.user?.name || 'Someone';
+    const creator = await UserModel.findById(req.user!.id).select('name').lean();
+    const creatorName = String((creator as any)?.name || '').trim() || 'Someone';
     for (const admin of admins) {
       const adminNotif = {
         title: 'New Task Created',
@@ -119,12 +117,20 @@ tasksRouter.put('/:id', async (req, res, next) => {
     const existing = await TaskModel.findById(req.params.id).lean();
     if (!existing) return res.status(404).json({ error: 'Task not found' });
 
-    // Team can only update their own tasks and cannot reassign
+    // Team permissions:
+    // - creator (assigner) can update and reassign
+    // - assignee (non-creator) can update, but cannot reassign
     if ((req as any).user?.role === 'team') {
-      if (String((req as any).user.id) !== String((existing as any).assigneeId)) return res.status(403).json({ error: 'Forbidden' });
-      delete patch.assigneeId;
-      delete patch.assigneeName;
-      delete patch.branch;
+      const myId = String((req as any).user.id);
+      const isCreator = myId === String((existing as any).assignerId);
+      const isAssignee = myId === String((existing as any).assigneeId);
+      if (!isCreator && !isAssignee) return res.status(403).json({ error: 'Forbidden' });
+
+      if (!isCreator) {
+        delete patch.assigneeId;
+        delete patch.assigneeName;
+        delete patch.branch;
+      }
     }
 
     // Admin/team-lead can only update tasks in their branch(es)
@@ -202,4 +208,3 @@ tasksRouter.delete('/:id', async (req, res, next) => {
     return next(e);
   }
 });
-

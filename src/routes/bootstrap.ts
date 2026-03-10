@@ -30,7 +30,7 @@ bootstrapRouter.get('/', async (req: AuthedRequest, res, next) => {
     const myBranch = (me as any)?.branch || '';
 
     const taskQuery: any = {};
-    if (isTeam) taskQuery.assigneeId = req.user!.id;
+    if (isTeam) taskQuery.$or = [{ assigneeId: req.user!.id }, { assignerId: req.user!.id }];
     else if (isAdmin && myBranch) taskQuery.branch = myBranch;
     // super-admin sees all tasks
 
@@ -203,4 +203,3 @@ bootstrapRouter.get('/', async (req: AuthedRequest, res, next) => {
     return next(e);
   }
 });
-
