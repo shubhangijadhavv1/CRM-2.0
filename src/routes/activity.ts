@@ -525,6 +525,27 @@ activityRouter.get('/screenshots', requireRole(['admin', 'super-admin']), async 
   }
 });
 
+// DELETE /api/activity/screenshots — admin/super-admin delete screenshots (optionally by userId)
+activityRouter.delete('/screenshots', requireRole(['admin', 'super-admin']), async (req: AuthedRequest, res, next) => {
+  try {
+    const userId = typeof req.query.userId === 'string' ? req.query.userId : undefined;
+    const q: any = {};
+    if (userId) q.userId = userId;
+    const result = await AgentScreenshotModel.deleteMany(q);
+    await AuditLogModel.create({
+      id: `audit-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      actorUserId: req.user!.id,
+      action: 'delete_screenshots',
+      targetUserId: userId || '',
+      metadata: JSON.stringify({ deletedCount: result.deletedCount || 0 }).slice(0, 4000)
+    }).catch(() => {});
+    emitInvalidate('activity');
+    return res.json({ ok: true, deletedCount: result.deletedCount || 0 });
+  } catch (e) {
+    return next(e);
+  }
+});
+
 // GET /api/activity/alerts — admin/super-admin alerts list
 activityRouter.get('/alerts', requireRole(['admin', 'super-admin']), async (req: AuthedRequest, res, next) => {
   try {
