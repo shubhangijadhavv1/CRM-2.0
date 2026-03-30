@@ -27,11 +27,12 @@ tasksRouter.get('/', async (req: AuthedRequest, res, next) => {
       const branch = String((req.query as any)?.branch || '').trim();
       if (branch) q.branch = branch;
     }
-    const docs = await TaskModel.find(q).lean();
+    const docs = await TaskModel.find(q).sort({ updatedAt: -1 }).lean();
     const tasks = docs.map((d: any) => {
       const t: any = { ...d, id: String(d._id) };
       delete t._id;
       delete t.__v;
+      if (t.assigneeId != null) t.assigneeId = String(t.assigneeId);
       if (t.assignerId != null) t.assignerId = String(t.assignerId);
       if (t.completedAt instanceof Date) t.completedAt = t.completedAt.toISOString();
       return t;
@@ -80,7 +81,8 @@ tasksRouter.post('/', async (req: AuthedRequest, res, next) => {
         title: 'New Task Assigned',
         message: `"${t.title || 'Untitled'}" has been assigned to you.`,
         type: 'alert' as const,
-        time: new Date().toISOString()
+        time: new Date().toISOString(),
+        link: { view: 'tasks', taskId: String(t.id) }
       };
       emitNotify(String(data.assigneeId), notifPayload);
       NotificationModel.create({ ...notifPayload, userId: String(data.assigneeId), read: false }).catch(() => {});
@@ -179,7 +181,8 @@ tasksRouter.put('/:id', async (req, res, next) => {
         title: 'Task Reassigned to You',
         message: `"${t.title || 'Untitled'}" has been assigned to you.`,
         type: 'alert' as const,
-        time: new Date().toISOString()
+        time: new Date().toISOString(),
+        link: { view: 'tasks', taskId: String(t.id) }
       };
       emitNotify(String(patch.assigneeId), notifPayload);
       NotificationModel.create({ ...notifPayload, userId: String(patch.assigneeId), read: false }).catch(() => {});

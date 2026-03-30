@@ -24,7 +24,7 @@ const AppSettingsSchema = new Schema<AppSettingsDoc>(
     forceNotificationPrompt: { type: Boolean, default: true },
     geminiApiKey: { type: String, default: '' },
     agentPolicy: {
-      type: {
+      type: new Schema({
         screenshotEnabled: { type: Boolean, default: true },
         screenshotIntervalSec: { type: Number, default: 300 },
         urlTrackingEnabled: { type: Boolean, default: true },
@@ -34,8 +34,8 @@ const AppSettingsSchema = new Schema<AppSettingsDoc>(
         idleAlertMinutes: { type: Number, default: 20 },
         blockedKeywords: { type: [String], default: [] },
         retentionDays: { type: Number, default: 7 }
-      },
-      default: {
+      }, { _id: false }),
+      default: () => ({
         screenshotEnabled: true,
         screenshotIntervalSec: 300,
         urlTrackingEnabled: true,
@@ -45,7 +45,7 @@ const AppSettingsSchema = new Schema<AppSettingsDoc>(
         idleAlertMinutes: 20,
         blockedKeywords: [],
         retentionDays: 7
-      }
+      })
     }
   },
   { timestamps: true }

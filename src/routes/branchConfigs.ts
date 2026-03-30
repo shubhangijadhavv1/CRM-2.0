@@ -42,29 +42,50 @@ const BRANCH_DEFAULTS: Record<string, any> = {
   holidays: []
 };
 
-function normalizeBranch(b: any): any {
-  const wp = b.weekendPolicy;
+/** Only schema fields — no createdAt/updatedAt/_id from client (avoids Mongoose $set cast errors). */
+function normalizeBranch(b: any): Record<string, unknown> {
+  const wp = b?.weekendPolicy;
+  const id = String(b?.id || '').trim();
+  const holidaysRaw = Array.isArray(b?.holidays) ? b.holidays : [];
+  const holidays = holidaysRaw
+    .map((h: any) => ({
+      date: String(h?.date || '').trim(),
+      name: String(h?.name || '').trim(),
+    }))
+    .filter((h: { date: string; name: string }) => h.date.length > 0 && h.name.length > 0);
+
+  const num = (v: unknown, fallback: number) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
+  };
+
   return {
-    ...BRANCH_DEFAULTS,
-    ...b,
-    id: b.id,
-    name: b.name ?? BRANCH_DEFAULTS.name,
-    startTime: b.startTime ?? BRANCH_DEFAULTS.startTime,
-    endTime: b.endTime ?? BRANCH_DEFAULTS.endTime,
-    lunchStart: b.lunchStart ?? BRANCH_DEFAULTS.lunchStart,
-    lunchEnd: b.lunchEnd ?? BRANCH_DEFAULTS.lunchEnd,
+    id,
+    name: String(b?.name ?? BRANCH_DEFAULTS.name).trim() || BRANCH_DEFAULTS.name,
+    startTime: String(b?.startTime ?? BRANCH_DEFAULTS.startTime),
+    endTime: String(b?.endTime ?? BRANCH_DEFAULTS.endTime),
+    lunchStart: String(b?.lunchStart ?? BRANCH_DEFAULTS.lunchStart),
+    lunchEnd: String(b?.lunchEnd ?? BRANCH_DEFAULTS.lunchEnd),
+    teaBreakDurationMinutes: Math.max(
+      0,
+      num(b?.teaBreakDurationMinutes, BRANCH_DEFAULTS.teaBreakDurationMinutes),
+    ),
+    lunchTimeLimitMinutes: Math.max(0, num(b?.lunchTimeLimitMinutes, 30)),
+    teaBreakTimeLimitMinutes: Math.max(0, num(b?.teaBreakTimeLimitMinutes, 15)),
+    autoLunchBreakThresholdMinutes: Math.max(0, num(b?.autoLunchBreakThresholdMinutes, 20)),
+    autoTeaBreakThresholdMinutes: Math.max(0, num(b?.autoTeaBreakThresholdMinutes, 10)),
+    lateMarkGraceMinutes: Math.max(0, num(b?.lateMarkGraceMinutes, 15)),
+    yearlyPaidLeaves: Math.max(0, num(b?.yearlyPaidLeaves, 12)),
+    ipRestrictions: Array.isArray(b?.ipRestrictions)
+      ? b.ipRestrictions.map((x: any) => String(x).trim()).filter(Boolean)
+      : [],
     weekendPolicy: {
-      sundayOff: wp?.sundayOff ?? true,
-      saturdaysOff: Array.isArray(wp?.saturdaysOff) ? wp.saturdaysOff : []
+      sundayOff: wp?.sundayOff !== false,
+      saturdaysOff: Array.isArray(wp?.saturdaysOff)
+        ? wp.saturdaysOff.map((n: any) => Number(n)).filter((n: number) => Number.isFinite(n))
+        : [],
     },
-    lunchTimeLimitMinutes: Math.max(0, Number(b.lunchTimeLimitMinutes) || 30),
-    teaBreakTimeLimitMinutes: Math.max(0, Number(b.teaBreakTimeLimitMinutes) || 15),
-    autoLunchBreakThresholdMinutes: Math.max(0, Number(b.autoLunchBreakThresholdMinutes) || 20),
-    autoTeaBreakThresholdMinutes: Math.max(0, Number(b.autoTeaBreakThresholdMinutes) || 10),
-    lateMarkGraceMinutes: Math.max(0, Number(b.lateMarkGraceMinutes) || 15),
-    yearlyPaidLeaves: Math.max(0, Number(b.yearlyPaidLeaves) || 12),
-    ipRestrictions: Array.isArray(b.ipRestrictions) ? b.ipRestrictions : [],
-    holidays: Array.isArray(b.holidays) ? b.holidays : []
+    holidays,
   };
 }
 
@@ -82,8 +103,12 @@ branchConfigsRouter.put('/', requireRole(['admin', 'super-admin']), async (req, 
     await Promise.all(
       list.map((b: any) => {
         const normalized = normalizeBranch(b);
-        return BranchConfigModel.findOneAndUpdate({ id: normalized.id }, { $set: normalized }, { upsert: true, new: true, setDefaultsOnInsert: true });
-      })
+        return BranchConfigModel.findOneAndUpdate(
+          { id: normalized.id as string },
+          { $set: normalized },
+          { upsert: true, new: true, setDefaultsOnInsert: true, runValidators: true },
+        );
+      }),
     );
     await BranchConfigModel.deleteMany({ id: { $nin: ids } });
 

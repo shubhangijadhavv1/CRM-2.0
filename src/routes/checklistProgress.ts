@@ -8,8 +8,18 @@ import { TaskModel } from '../models/Task.js';
 import { NotificationModel } from '../models/Notification.js';
 import { emitNotify } from '../realtime/notify.js';
 import crypto from 'node:crypto';
+import mongoose from 'mongoose';
 import { UserModel } from '../models/User.js';
 import { ChecklistTemplateModel } from '../models/ChecklistTemplate.js';
+
+// Safely find a project whether projectId is a MongoDB ObjectId or a custom string
+async function findProject(projectId: string) {
+  if (mongoose.Types.ObjectId.isValid(projectId)) {
+    const p = await ProjectModel.findById(projectId).lean();
+    if (p) return p;
+  }
+  return null;
+}
 
 export const checklistProgressRouter = Router();
 
@@ -62,7 +72,7 @@ checklistProgressRouter.put('/:projectId', async (req: AuthedRequest, res, next)
     // - Stage 2 changes: only the assigned QA (stage2AssigneeId) can change stage2/stage2Notes
     if (req.user?.role === 'team') {
       const me = await UserModel.findById(req.user.id).lean();
-      const proj = await ProjectModel.findById(projectId).lean();
+      const proj = await findProject(projectId);
       const myName = (me as any)?.name || '';
       const projectAssigneeName = (proj as any)?.assignee || '';
 
@@ -105,7 +115,7 @@ checklistProgressRouter.put('/:projectId', async (req: AuthedRequest, res, next)
 
     // Sync QA progress back to Project so the Project table reflects checklist completion in real-time.
     try {
-      const project = await ProjectModel.findById(projectId).lean();
+      const project = await findProject(projectId);
       const tmplDoc = await ChecklistTemplateModel.findOne({ key: 'default' }).lean();
       const templates = tmplDoc ? ((tmplDoc as any).templates || {}) : {};
       const items: string[] = project ? (templates[(project as any).category] || []) : [];
@@ -126,7 +136,11 @@ checklistProgressRouter.put('/:projectId', async (req: AuthedRequest, res, next)
       if (qa2 === 100) patch.status = 'Completed';
 
       if (project && Object.keys(patch).length) {
-        await ProjectModel.findByIdAndUpdate(projectId, { $set: patch }, { new: false }).lean();
+        if (mongoose.Types.ObjectId.isValid(projectId)) {
+          await ProjectModel.findByIdAndUpdate(projectId, { $set: patch }, { new: false }).lean();
+        } else {
+          await ProjectModel.findOneAndUpdate({ id: projectId }, { $set: patch }, { new: false }).lean();
+        }
         emitInvalidate('projects');
       }
     } catch {
@@ -137,7 +151,7 @@ checklistProgressRouter.put('/:projectId', async (req: AuthedRequest, res, next)
     const newQaId = String((updated as any).stage2AssigneeId || '');
     const prevQaId = String((prev as any)?.stage2AssigneeId || '');
     if (newQaId && newQaId !== prevQaId) {
-      const project = await ProjectModel.findById(projectId).lean();
+      const project = await findProject(projectId);
       const qaUser = await UserModel.findById(newQaId).lean();
       const assignerUser = await UserModel.findById(req.user!.id).lean();
 
@@ -184,7 +198,8 @@ checklistProgressRouter.put('/:projectId', async (req: AuthedRequest, res, next)
         message: notificationMessage,
         type: 'alert' as const,
         time: 'Just now',
-        read: false
+        read: false,
+        link: { view: 'checklist', projectId }
       };
       await NotificationModel.create(notif);
       emitInvalidate('notifications');

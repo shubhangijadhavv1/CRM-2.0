@@ -9,6 +9,32 @@ export const aiRouter = Router();
 aiRouter.use(requireAuth);
 aiRouter.use(requireDb);
 
+function parseModelJson(text: string): { summary: string; recommendation: string } | null {
+  const cleaned = String(text || '').trim();
+  if (!cleaned) return null;
+  const attempts = [
+    cleaned,
+    cleaned.replace(/^```json\s*/i, '').replace(/```$/i, '').trim(),
+  ];
+  for (const a of attempts) {
+    try {
+      const parsed: any = JSON.parse(a);
+      const summary = String(parsed?.summary || '').trim();
+      const recommendation = String(parsed?.recommendation || '').trim();
+      if (summary || recommendation) {
+        return {
+          summary: summary || 'GDC Assistant generated an empty summary.',
+          recommendation:
+            recommendation || 'Review team attendance and pending tasks, then re-run analysis.',
+        };
+      }
+    } catch {
+      // try next
+    }
+  }
+  return null;
+}
+
 /** POST /api/ai/generate-insight — generate GDC Assistant insight using Gemini key from MongoDB */
 aiRouter.post('/generate-insight', async (req: AuthedRequest, res, next) => {
   try {
@@ -67,7 +93,7 @@ Tone: Friendly, direct, professional. Plain English. No jargon.
 `;
     const ai = new GoogleGenAI({ apiKey });
     const response = await ai.models.generateContent({
-      model: 'gemini-2.0-flash',
+      model: 'gemini-2.0-flash-lite',
       contents: prompt,
       config: {
         responseMimeType: 'application/json',
@@ -83,30 +109,47 @@ Tone: Friendly, direct, professional. Plain English. No jargon.
     });
     const text = response.text;
     if (!text) return res.status(502).json({ error: 'No response from AI' });
-    const result = JSON.parse(text);
-    return res.json(result);
+    const parsed = parseModelJson(text);
+    if (parsed) return res.json(parsed);
+    return res.json({
+      summary: text.slice(0, 800),
+      recommendation:
+        'Review the generated summary and follow up with pending attendance or task actions.'
+    });
   } catch (e: any) {
     console.error('AI generate-insight error:', e);
     const msg = e?.message ?? String(e);
     const status = e?.status ?? e?.statusCode;
-    const isAuth = status === 401 || status === 403 || /invalid.*api.*key|api key not valid|permission denied/i.test(msg);
+    // Parse JSON error body from Gemini ApiError if present
+    let parsedMsg = msg;
+    let parsedCode = status;
+    try { const p = JSON.parse(msg); parsedMsg = p?.error?.message ?? msg; parsedCode = p?.error?.code ?? status; } catch {}
+    const isQuota = parsedCode === 429 || /quota|rate.?limit|RESOURCE_EXHAUSTED|exceeded your current quota/i.test(msg);
+    const isAuth = !isQuota && (parsedCode === 400 || parsedCode === 401 || parsedCode === 403 || /invalid.*api.*key|api key not valid|permission denied|api_key_invalid|INVALID_ARGUMENT/i.test(msg));
     const isNetwork = /fetch|network|connection|refused|failed to fetch/i.test(msg);
+    if (isQuota) {
+      return res.status(200).json({
+        summary: 'GDC Assistant: Gemini API quota exceeded.',
+        recommendation: 'Your Gemini API free tier quota is exhausted. Either wait a minute and try again, or enable billing on your Google AI Studio project to increase limits.'
+      });
+    }
     if (isAuth) {
       return res.status(200).json({
-        summary: 'GDC Assistant could not authenticate with the AI service.',
+        summary: 'GDC Assistant: Invalid or missing Gemini API key.',
         recommendation:
-          'In Settings → AI Integration, check that the stored Gemini API key is correct and has access to the Gemini API.'
+          'Go to Settings → AI Integration and check that the Gemini API key is correct. Make sure it is a valid key from Google AI Studio with access to the Gemini API.'
       });
     }
     if (isNetwork) {
       return res.status(200).json({
         summary: 'GDC Assistant could not reach the AI service.',
-        recommendation: 'Check your internet connection and try again.'
+        recommendation: 'Check the server\'s internet connection and try again.'
       });
     }
+    const shortMsg = parsedMsg && parsedMsg.length < 200 ? parsedMsg : msg && msg.length < 200 ? msg : '';
     return res.status(200).json({
-      summary: 'GDC Assistant is offline. Please try again later.',
-      recommendation: msg && msg.length < 120 ? msg : 'Check internet connection and the API key in Settings → AI Integration.'
+      summary: 'GDC Assistant encountered an error.',
+      recommendation: shortMsg || 'Check the server logs for details. Ensure the Gemini API key is set correctly in Settings → AI Integration.'
     });
   }
 });

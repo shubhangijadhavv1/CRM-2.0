@@ -42,5 +42,8 @@ const TaskSchema = new Schema<TaskDoc>(
   { timestamps: true }
 );
 
+TaskSchema.index({ branch: 1, updatedAt: -1 });
+TaskSchema.index({ assigneeId: 1, assignerId: 1 });
+
 export const TaskModel = mongoose.model<TaskDoc>('Task', TaskSchema);
 

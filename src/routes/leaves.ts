@@ -72,7 +72,8 @@ leavesRouter.post('/', async (req: AuthedRequest, res, next) => {
           title: 'New Leave Request',
           message,
           type: 'alert',
-          time: new Date().toISOString()
+          time: new Date().toISOString(),
+          link: { view: 'attendance', leaveId: String(created.id) }
         });
         sendPushToUser(adminId, {
           title: 'New Leave Request',
@@ -112,7 +113,8 @@ leavesRouter.put('/:id', requireRole(['admin', 'super-admin']), async (req, res,
         title: partial ? 'Leave partially approved' : `Leave ${statusLabel}`,
         message,
         type: leaveData.status === 'approved' ? 'success' : 'alert',
-        time: new Date().toISOString()
+        time: new Date().toISOString(),
+        link: { view: 'attendance', leaveId: String(leaveData.id) }
       });
     }
 

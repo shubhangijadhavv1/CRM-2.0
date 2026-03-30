@@ -45,7 +45,8 @@ noticesRouter.post('/', requireRole(['admin', 'super-admin']), async (req: Authe
       title: `New Notice: ${notice.title || 'Announcement'}`,
       message: (notice.content || '').slice(0, 100),
       type: (notice.type === 'urgent' || notice.type === 'warning') ? 'alert' : 'info',
-      time: new Date().toISOString()
+      time: new Date().toISOString(),
+      link: { view: 'notice-board', noticeId: String(notice.id) }
     };
     const creatorId = String(req.user!.id);
     const targetAudience = notice.targetAudience || 'all';

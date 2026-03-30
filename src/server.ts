@@ -1,5 +1,6 @@
 import './config/env.js';
 import express from 'express';
+import compression from 'compression';
 import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
@@ -42,27 +43,38 @@ const httpServer = createServer(app);
 // In localhost dev, this still works (req.ip will be 127.0.0.1/::1).
 app.set('trust proxy', true);
 
+app.use(compression({ threshold: 1024 }));
 
 app.use(express.json({ limit: '10mb' }));
 
-const clientOrigin = process.env.CLIENT_ORIGIN || 'http://127.0.0.1:5174';
+const clientOrigin = process.env.CLIENT_ORIGIN || 'http://127.0.0.1:5176';
 const allowedOrigins = new Set([
   clientOrigin,
   'http://127.0.0.1:5174',
   'http://localhost:5174',
   'http://0.0.0.0:5174',
+  'http://127.0.0.1:5176',
+  'http://localhost:5176',
+  'http://0.0.0.0:5176',
   'http://127.0.0.1:5173',
   'http://localhost:5173',
   'http://0.0.0.0:5173',
-  'http://127.0.0.1:5174',
-  'http://localhost:5174',
-  'http://0.0.0.0:5174',
   'http://127.0.0.1:5175',
   'http://localhost:5175',
   'http://0.0.0.0:5175'
 ]);
-// Allow any host on common dev ports (3000, 5170–5179)
-const devPortRegex = /^https?:\/\/[^/]+:(3000|517[0-9])$/;
+// Allow any host on common dev ports (3000, 5170–5179, 5180–5189)
+const devPortRegex = /^https?:\/\/[^/]+:(3000|517[0-9]|518[0-9])$/;
+
+// Socket.IO only accepts an explicit origin list (no regex) — mirror common Vite fallbacks.
+const socketAllowedOrigins = new Set<string>(allowedOrigins);
+for (let p = 5170; p <= 5189; p++) {
+  socketAllowedOrigins.add(`http://127.0.0.1:${p}`);
+  socketAllowedOrigins.add(`http://localhost:${p}`);
+}
+for (let p = 5180; p <= 5189; p++) {
+  socketAllowedOrigins.add(`http://0.0.0.0:${p}`);
+}
 app.use(
   cors({
     origin: (origin, cb) => {
@@ -85,7 +97,16 @@ app.use(
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const buildPath = path.resolve(__dirname, 'dist');
-app.use(express.static(buildPath));
+app.use(
+  express.static(buildPath, {
+    setHeaders(res, filePath) {
+      // Always revalidate shell so new JS/CSS hashes load after `vite build` (port 5001 users).
+      if (filePath.endsWith('index.html')) {
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+      }
+    },
+  }),
+);
 
 const downloadDirectories = [
   process.env.DOWNLOADS_DIR,
@@ -205,7 +226,7 @@ async function start() {
     await ensureInitialSuperAdmin();
   }
 
-  initIo(httpServer, [...allowedOrigins]);
+  initIo(httpServer, [...socketAllowedOrigins]);
   configureWebPush();
 
   httpServer.listen(port, () => {

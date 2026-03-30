@@ -11,17 +11,32 @@ import { AgentScreenshotModel } from '../models/AgentScreenshot.js';
 import { AgentAlertModel } from '../models/AgentAlert.js';
 import { AuditLogModel } from '../models/AuditLog.js';
 import { TaskModel } from '../models/Task.js';
+import { BranchConfigModel } from '../models/BranchConfig.js';
 import { emitInvalidate } from '../realtime/invalidate.js';
 import { emitNotify } from '../realtime/notify.js';
+import { emitUserStatus } from '../realtime/io.js';
 
 export const activityRouter = Router();
 
 activityRouter.use(requireAuth);
 activityRouter.use(requireDb);
 
-const ACTIVITY_LOG_RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const AGENT_HEALTH_MS = 2 * 60 * 1000;
+/** Purge activity logs older than retentionDays (from policy). Falls back to 7 days. */
+async function pruneActivityLogs(userId: string, retentionDays?: number): Promise<void> {
+  const days = Math.max(1, Math.min(30, Number(retentionDays) || 7));
+  await ActivityLogModel.deleteMany({
+    userId,
+    at: { $lt: new Date(Date.now() - days * 24 * 60 * 60 * 1000) }
+  }).catch(() => {});
+}
 const idleAlertState = new Map<string, { openSince: string; lastAlertAt: number }>();
+// Per-user blocked-keyword alert cooldown: don't spam alerts for the same keyword
+const keywordAlertCooldown = new Map<string, number>(); // key: `${userId}:${keyword}` → lastAlertAt ms
+const KEYWORD_ALERT_COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes between same-keyword alerts per user
+
+// Max base64 size accepted (~300 KB decoded) to protect MongoDB from oversized screenshots
+const SCREENSHOT_MAX_B64_CHARS = 450_000; // ~337 KB decoded PNG/JPEG
 
 function todayStr() {
   return new Date().toISOString().split('T')[0];
@@ -40,14 +55,16 @@ async function createAdminAlert(ruleKey: string, userId: string, message: string
       message,
       type: severity === 'critical' ? 'alert' : 'info',
       time: now,
-      read: false
+      read: false,
+      link: { view: 'live-workplace', userId }
     }));
     await NotificationModel.insertMany(rows).catch(() => {});
     for (const u of admins) {
       emitNotify(String((u as any)._id), {
         id: `realtime-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         title: 'Desktop Agent Alert',
-        message
+        message,
+        link: { view: 'live-workplace', userId }
       });
     }
   }
@@ -74,7 +91,8 @@ activityRouter.post('/heartbeat', async (req: AuthedRequest, res, next) => {
   try {
     const body = req.body ?? {};
     const lastActivityAt = Number(body.lastActivityAt);
-    const serverIdleAfterMs = Math.max(5000, Number(process.env.BROWSER_IDLE_AFTER_MS) || 60000);
+    // Default 35s: faster idle visibility on admin dashboards; override with BROWSER_IDLE_AFTER_MS (ms).
+    const serverIdleAfterMs = Math.max(5000, Number(process.env.BROWSER_IDLE_AFTER_MS) || 35000);
     const serverIdleForMs = Math.max(0, Date.now() - lastActivityAt);
     const serverIsIdle = serverIdleForMs >= serverIdleAfterMs;
     const reason = typeof body.reason === 'string' ? body.reason : 'interval';
@@ -149,10 +167,8 @@ activityRouter.post('/heartbeat', async (req: AuthedRequest, res, next) => {
         }
       }
     }
-    await ActivityLogModel.deleteMany({
-      userId: req.user!.id,
-      at: { $lt: new Date(Date.now() - ACTIVITY_LOG_RETENTION_MS) }
-    }).catch(() => {});
+    // Prune old activity logs using policy retention days (not hardcoded)
+    void pruneActivityLogs(req.user!.id, (await getAgentPolicy()).retentionDays);
     if (!updated) return res.status(404).json({ error: 'User not found' });
 
     // --- Update today's attendance live status based on browser-wide activity ---
@@ -183,25 +199,34 @@ activityRouter.post('/heartbeat', async (req: AuthedRequest, res, next) => {
           { new: false }
         );
       } else {
+        // Activity detected — ALWAYS set dailyStatus back to 'checked-in'
+        const updatePatch: any = { dailyStatus: 'checked-in' };
         if (openIdx !== -1) {
           const startMs = new Date(idleIntervals[openIdx].startTime).getTime();
           const endMs = new Date(activeIso).getTime();
           const durationMs = Math.max(0, endMs - startMs);
-          const deducted = durationMs > 5 * 60 * 1000;
+          const deducted = true; // Always count idle time, regardless of duration
           idleIntervals[openIdx] = { ...idleIntervals[openIdx], endTime: activeIso, deducted };
-          const addMinutes = deducted ? Math.floor(durationMs / 60000) : 0;
-          const nextIdleMinutes = (Number(att.idleMinutes) || 0) + addMinutes;
-          await AttendanceModel.findOneAndUpdate(
-            { id: att.id },
-            { $set: { idleIntervals, idleMinutes: nextIdleMinutes, dailyStatus: 'checked-in' } },
-            { new: false }
-          );
-        } else if (att.dailyStatus === 'idle') {
-          await AttendanceModel.findOneAndUpdate({ id: att.id }, { $set: { dailyStatus: 'checked-in' } }, { new: false });
+          const addMinutes = Math.floor(durationMs / 60000);
+          updatePatch.idleIntervals = idleIntervals;
+          updatePatch.idleMinutes = (Number(att.idleMinutes) || 0) + addMinutes;
         }
+        await AttendanceModel.findOneAndUpdate(
+          { id: att.id },
+          { $set: updatePatch },
+          { new: false }
+        );
       }
     }
 
+    // Emit lightweight real-time status update to all admins instantly
+    emitUserStatus({
+      userId: req.user!.id,
+      browserIsIdle: serverIsIdle,
+      browserIdleForMs: serverIdleForMs,
+      lastBrowserActivityAt: new Date(lastActivityAt).toISOString(),
+      lastBrowserHeartbeatAt: new Date().toISOString(),
+    });
     emitInvalidate('users');
     emitInvalidate('attendance');
     return res.json({ ok: true });
@@ -271,10 +296,7 @@ activityRouter.post('/agent-login', async (req: AuthedRequest, res, next) => {
       eventType: 'agent-login'
     }).catch(() => {});
 
-    await ActivityLogModel.deleteMany({
-      userId: req.user!.id,
-      at: { $lt: new Date(Date.now() - ACTIVITY_LOG_RETENTION_MS) }
-    }).catch(() => {});
+    void pruneActivityLogs(req.user!.id, (await getAgentPolicy()).retentionDays);
 
     emitInvalidate('users');
     emitInvalidate('attendance');
@@ -321,9 +343,62 @@ activityRouter.post('/agent-logout', async (req: AuthedRequest, res, next) => {
     const date = todayStr();
     const openRecord = await AttendanceModel.findOne({ userId, date, checkOutTime: null }).sort({ checkInTime: -1 }).lean();
     if (openRecord?.id) {
+      const nowMs = now.getTime();
+      const idleIntervals = Array.isArray(openRecord.idleIntervals) ? openRecord.idleIntervals.map((i: any) => ({ ...i })) : [];
+      const breaks = Array.isArray(openRecord.breaks) ? openRecord.breaks.map((b: any) => ({ ...b })) : [];
+
+      // Close any open idle interval
+      let finalIdleMinutes = Number(openRecord.idleMinutes) || 0;
+      const openIdleIdx = idleIntervals.findIndex((i: any) => i.endTime === null);
+      if (openIdleIdx !== -1) {
+        const duration = nowMs - new Date(idleIntervals[openIdleIdx].startTime).getTime();
+        const deducted = true; // Always count idle time
+        idleIntervals[openIdleIdx] = { ...idleIntervals[openIdleIdx], endTime: now.toISOString(), deducted };
+        finalIdleMinutes += Math.floor(duration / 60000);
+      }
+
+      // Close any open break
+      const openBreakIdx = breaks.findIndex((b: any) => b.endTime === null);
+      if (openBreakIdx !== -1) {
+        breaks[openBreakIdx] = { ...breaks[openBreakIdx], endTime: now.toISOString() };
+      }
+
+      // Compute totalWorkMinutes: session - breaks(capped) - idle - excessBreak
+      let totalWorkMinutes = 0;
+      if (openRecord.checkInTime) {
+        const checkInMs = new Date(openRecord.checkInTime).getTime();
+        const totalSessionMs = nowMs - checkInMs;
+
+        const branchId = String(openRecord.branch || '');
+        const branchConfig = branchId ? await BranchConfigModel.findOne({ $or: [{ id: branchId }, { name: branchId }] }).lean() : null;
+        const lunchTimeLimit = Number((branchConfig as any)?.lunchTimeLimitMinutes) || 30;
+        const teaBreakTimeLimit = Number((branchConfig as any)?.teaBreakTimeLimitMinutes) || 15;
+
+        let allowedBreakMs = 0;
+        let excessBreakMs = 0;
+        breaks.forEach((b: any) => {
+          const bStart = new Date(b.startTime).getTime();
+          const bEnd = b.endTime ? new Date(b.endTime).getTime() : nowMs;
+          const durationMin = Math.floor((bEnd - bStart) / 60000);
+          const limit = b.type === 'lunch' ? lunchTimeLimit : teaBreakTimeLimit;
+          allowedBreakMs += Math.min(durationMin, limit) * 60000;
+          if (durationMin > limit) excessBreakMs += (durationMin - limit) * 60000;
+        });
+
+        const totalIdleMs = finalIdleMinutes * 60000;
+        totalWorkMinutes = Math.max(0, Math.floor((totalSessionMs - allowedBreakMs - totalIdleMs - excessBreakMs) / 60000));
+      }
+
       await AttendanceModel.findOneAndUpdate(
         { id: openRecord.id },
-        { $set: { checkOutTime: now.toISOString(), dailyStatus: 'checked-out' } },
+        { $set: {
+          checkOutTime: now.toISOString(),
+          dailyStatus: 'checked-out',
+          idleIntervals,
+          breaks,
+          idleMinutes: finalIdleMinutes,
+          totalWorkMinutes
+        } },
         { new: false }
       );
     }
@@ -367,6 +442,9 @@ activityRouter.post('/events', async (req: AuthedRequest, res, next) => {
     }
     if (toCreate.length > 0) {
       await ActivityLogModel.insertMany(toCreate).catch(() => {});
+      // Prune old logs (non-blocking) using policy retention
+      const policy = await getAgentPolicy();
+      void pruneActivityLogs(req.user!.id, policy.retentionDays);
       emitInvalidate('activity');
     }
     return res.json({ ok: true, received: toCreate.length });
@@ -408,14 +486,20 @@ activityRouter.post('/window-events', async (req: AuthedRequest, res, next) => {
           const hay = `${row.appName} ${row.windowTitle} ${row.domain} ${row.url}`.toLowerCase();
           const hit = blocked.find((k: string) => k && hay.includes(String(k).toLowerCase()));
           if (hit) {
-            const me = await UserModel.findById(req.user!.id).select('name').lean();
-            await createAdminAlert(
-              'blocked-keyword',
-              req.user!.id,
-              `${(me as any)?.name || 'Staff'} opened restricted content keyword "${hit}".`,
-              `${row.appName} | ${row.windowTitle}`.slice(0, 500),
-              'critical'
-            );
+            // Cooldown: only alert once per 15 min per user+keyword to prevent spam
+            const cooldownKey = `${req.user!.id}:${hit.toLowerCase()}`;
+            const lastAlertAt = keywordAlertCooldown.get(cooldownKey) || 0;
+            if (Date.now() - lastAlertAt >= KEYWORD_ALERT_COOLDOWN_MS) {
+              keywordAlertCooldown.set(cooldownKey, Date.now());
+              const me = await UserModel.findById(req.user!.id).select('name').lean();
+              await createAdminAlert(
+                'blocked-keyword',
+                req.user!.id,
+                `${(me as any)?.name || 'Staff'} opened restricted content: "${hit}".`,
+                `${row.appName} | ${row.windowTitle}`.slice(0, 500),
+                'critical'
+              );
+            }
             break;
           }
         }
@@ -438,15 +522,27 @@ activityRouter.post('/screenshots', async (req: AuthedRequest, res, next) => {
   try {
     const policy = await getAgentPolicy();
     if (!policy.screenshotEnabled) return res.json({ ok: true, stored: false, skipped: 'screenshotDisabled' });
+
     const imageDataUrl = typeof req.body?.imageDataUrl === 'string' ? req.body.imageDataUrl : '';
     if (!imageDataUrl.startsWith('data:image/')) {
       return res.status(400).json({ error: 'imageDataUrl is required' });
     }
+
+    // Reject screenshots that are too large to protect MongoDB storage
+    if (imageDataUrl.length > SCREENSHOT_MAX_B64_CHARS) {
+      return res.status(413).json({
+        error: 'Screenshot too large. Reduce capture resolution or quality on the agent.',
+        maxChars: SCREENSHOT_MAX_B64_CHARS,
+        receivedChars: imageDataUrl.length
+      });
+    }
+
     const at = req.body?.at ? new Date(req.body.at) : new Date();
     const mimeType = typeof req.body?.mimeType === 'string' ? req.body.mimeType : 'image/jpeg';
     const width = Number(req.body?.width) || 0;
     const height = Number(req.body?.height) || 0;
     const sizeBytes = Number(req.body?.sizeBytes) || Math.floor((imageDataUrl.length * 3) / 4);
+
     await AgentScreenshotModel.create({
       userId: req.user!.id,
       at,
@@ -457,13 +553,29 @@ activityRouter.post('/screenshots', async (req: AuthedRequest, res, next) => {
       sizeBytes,
       source: 'desktop-agent'
     });
-    const retentionDays = Math.max(1, Number(policy.retentionDays) || 7);
+
+    // Enforce retention: delete screenshots older than retentionDays
+    const retentionDays = Math.max(1, Math.min(30, Number(policy.retentionDays) || 3));
     await AgentScreenshotModel.deleteMany({
       userId: req.user!.id,
       at: { $lt: new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000) }
     }).catch(() => {});
+
+    // Hard cap: keep at most 200 screenshots per user (delete oldest beyond cap)
+    const totalCount = await AgentScreenshotModel.countDocuments({ userId: req.user!.id });
+    if (totalCount > 200) {
+      const oldest = await AgentScreenshotModel.find({ userId: req.user!.id })
+        .sort({ at: 1 })
+        .limit(totalCount - 200)
+        .select('_id')
+        .lean();
+      if (oldest.length > 0) {
+        await AgentScreenshotModel.deleteMany({ _id: { $in: oldest.map((d: any) => d._id) } }).catch(() => {});
+      }
+    }
+
     emitInvalidate('activity');
-    return res.json({ ok: true, stored: true });
+    return res.json({ ok: true, stored: true, sizeBytes });
   } catch (e) {
     return next(e);
   }
@@ -494,32 +606,59 @@ activityRouter.get('/window-events', requireRole(['admin', 'super-admin']), asyn
   }
 });
 
-// GET /api/activity/screenshots — admin/super-admin screenshot feed by staff
+// GET /api/activity/screenshots — admin/super-admin screenshot feed (metadata only by default)
+// Add ?withImage=1 to include base64 imageDataUrl in response (expensive — use sparingly)
 activityRouter.get('/screenshots', requireRole(['admin', 'super-admin']), async (req: AuthedRequest, res, next) => {
   try {
     const userId = typeof req.query.userId === 'string' ? req.query.userId : undefined;
-    const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
+    const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 20));
+    const withImage = req.query.withImage === '1';
     const q: any = {};
     if (userId) q.userId = userId;
-    const shots = await AgentScreenshotModel.find(q).sort({ at: -1 }).limit(limit).lean();
+
+    // By default return metadata only — exclude imageDataUrl to keep response small
+    const select = withImage ? undefined : '-imageDataUrl';
+    const shots = await AgentScreenshotModel.find(q).sort({ at: -1 }).limit(limit).select(select ?? '').lean();
+
     await AuditLogModel.create({
       id: `audit-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       actorUserId: req.user!.id,
       action: 'view_screenshots',
       targetUserId: userId || '',
-      metadata: JSON.stringify({ limit }).slice(0, 4000)
+      metadata: JSON.stringify({ limit, withImage }).slice(0, 4000)
     }).catch(() => {});
+
     return res.json({
       screenshots: shots.map((s: any) => ({
+        id: String(s._id),
         userId: s.userId,
         at: s.at,
-        imageDataUrl: s.imageDataUrl,
         mimeType: s.mimeType,
-        width: s.width,
-        height: s.height,
-        sizeBytes: s.sizeBytes
+        width: s.width || 0,
+        height: s.height || 0,
+        sizeBytes: s.sizeBytes || 0,
+        ...(withImage ? { imageDataUrl: s.imageDataUrl } : {})
       }))
     });
+  } catch (e) {
+    return next(e);
+  }
+});
+
+// GET /api/activity/screenshots/:id/image — fetch single screenshot image on demand
+activityRouter.get('/screenshots/:id/image', requireRole(['admin', 'super-admin']), async (req: AuthedRequest, res, next) => {
+  try {
+    const shot = await AgentScreenshotModel.findById(req.params.id).select('imageDataUrl mimeType userId').lean() as any;
+    if (!shot) return res.status(404).json({ error: 'Screenshot not found' });
+    // Return as proper image response to save bandwidth (no JSON wrapper)
+    const base64 = String(shot.imageDataUrl || '');
+    const match = base64.match(/^data:(image\/[a-z+]+);base64,(.+)$/);
+    if (!match) return res.status(422).json({ error: 'Invalid image data' });
+    const buf = Buffer.from(match[2], 'base64');
+    res.set('Content-Type', match[1]);
+    res.set('Content-Length', String(buf.length));
+    res.set('Cache-Control', 'private, max-age=3600');
+    return res.end(buf);
   } catch (e) {
     return next(e);
   }
@@ -663,6 +802,59 @@ activityRouter.get('/logs', requireRole(['admin', 'super-admin']), async (req: A
       eventType: l.eventType || undefined
     }));
     return res.json({ logs: out });
+  } catch (e) {
+    return next(e);
+  }
+});
+
+// POST /api/activity/cleanup — admin/super-admin: bulk delete temporary/log collections
+// Safe collections only — Attendance, Leave, Projects, Tasks, Users are NEVER touched.
+// Body: { targets: Array<'activity-logs'|'window-events'|'agent-alerts-resolved'|'audit-logs'|'notifications-read'>, olderThanDays?: number }
+activityRouter.post('/cleanup', requireRole(['admin', 'super-admin']), async (req: AuthedRequest, res, next) => {
+  try {
+    const targets: string[] = Array.isArray(req.body?.targets) ? req.body.targets : [];
+    const olderThanDays = Math.max(1, Number(req.body?.olderThanDays) || 30);
+    const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000);
+
+    const result: Record<string, number> = {};
+
+    if (targets.includes('activity-logs')) {
+      const r = await ActivityLogModel.deleteMany({ at: { $lt: cutoff } });
+      result['activity-logs'] = r.deletedCount ?? 0;
+    }
+
+    if (targets.includes('window-events')) {
+      const r = await AgentWindowEventModel.deleteMany({ at: { $lt: cutoff } });
+      result['window-events'] = r.deletedCount ?? 0;
+    }
+
+    if (targets.includes('agent-alerts-resolved')) {
+      // Only delete alerts that have been resolved AND are older than cutoff
+      const r = await AgentAlertModel.deleteMany({
+        resolvedAt: { $ne: null, $lt: cutoff }
+      });
+      result['agent-alerts-resolved'] = r.deletedCount ?? 0;
+    }
+
+    if (targets.includes('audit-logs')) {
+      const r = await AuditLogModel.deleteMany({ createdAt: { $lt: cutoff } });
+      result['audit-logs'] = r.deletedCount ?? 0;
+    }
+
+    if (targets.includes('notifications-read')) {
+      const r = await NotificationModel.deleteMany({ read: true, createdAt: { $lt: cutoff } });
+      result['notifications-read'] = r.deletedCount ?? 0;
+    }
+
+    const total = Object.values(result).reduce((s, n) => s + n, 0);
+    await AuditLogModel.create({
+      id: `audit-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      actorUserId: req.user!.id,
+      action: 'db_cleanup',
+      metadata: JSON.stringify({ targets, olderThanDays, result }).slice(0, 4000)
+    }).catch(() => {});
+
+    return res.json({ deleted: result, total });
   } catch (e) {
     return next(e);
   }

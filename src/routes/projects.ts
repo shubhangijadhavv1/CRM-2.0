@@ -13,10 +13,9 @@ export const projectsRouter = Router();
 projectsRouter.use(requireAuth);
 projectsRouter.use(requireDb);
 
-async function notifyAssigneeProjectAssigned(assigneeName: string, projectName: string, projectType: string, creatorId: string) {
+async function notifyAssigneeProjectAssigned(assigneeName: string, projectName: string, projectType: string, creatorId: string, projectId: string) {
   const name = (assigneeName || '').trim();
   if (!name) return;
-  // Find user by assignee name (exact or case-insensitive)
   let assigneeUser = await UserModel.findOne({ name, status: 'active' }).lean();
   if (!assigneeUser) {
     assigneeUser = await UserModel.findOne({ name: new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i'), status: 'active' }).lean();
@@ -34,7 +33,8 @@ async function notifyAssigneeProjectAssigned(assigneeName: string, projectName: 
     message: `You have been assigned to "${projectName}".`,
     type: 'alert' as const,
     time: 'Just now',
-    read: false
+    read: false,
+    link: { view: 'projects', projectId }
   };
   await NotificationModel.create(notif).catch(() => {});
   emitInvalidate('notifications');
@@ -43,7 +43,7 @@ async function notifyAssigneeProjectAssigned(assigneeName: string, projectName: 
 
 projectsRouter.get('/', async (_req, res, next) => {
   try {
-    const docs = await ProjectModel.find().lean();
+    const docs = await ProjectModel.find().sort({ createdAt: -1 }).lean();
     const projects = docs.map((d: any) => ({ ...d, id: String(d._id) }));
     projects.forEach((p: any) => {
       delete p._id;
@@ -67,7 +67,7 @@ projectsRouter.post('/', async (req: AuthedRequest, res, next) => {
 
     const assigneeName = (data.assignee || '').trim();
     if (assigneeName && req.user?.id) {
-      await notifyAssigneeProjectAssigned(assigneeName, p.name || 'Project', data.type || 'live', String(req.user.id));
+      await notifyAssigneeProjectAssigned(assigneeName, p.name || 'Project', data.type || 'live', String(req.user.id), String(p.id));
     }
 
     return res.status(201).json({ project: p });
@@ -89,7 +89,7 @@ projectsRouter.put('/:id', async (req: AuthedRequest, res, next) => {
     const newAssignee = (req.body?.assignee ?? (updated as any).assignee ?? '').trim();
     const prevAssignee = (prev as any)?.assignee ?? '';
     if (newAssignee && newAssignee !== prevAssignee && req.user?.id) {
-      await notifyAssigneeProjectAssigned(newAssignee, p.name || 'Project', (updated as any).type || 'live', String(req.user.id));
+      await notifyAssigneeProjectAssigned(newAssignee, p.name || 'Project', (updated as any).type || 'live', String(req.user.id), String(p.id));
     }
 
     return res.json({ project: p });

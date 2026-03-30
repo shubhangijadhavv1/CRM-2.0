@@ -2,7 +2,6 @@ import { Router } from 'express';
 import { requireAuth, type AuthedRequest } from '../middleware/auth.js';
 import { requireDb } from '../middleware/db.js';
 import { UserModel } from '../models/User.js';
-import { TaskModel } from '../models/Task.js';
 import { ProjectModel } from '../models/Project.js';
 import { AttendanceModel } from '../models/Attendance.js';
 import { LeaveModel } from '../models/Leave.js';
@@ -17,31 +16,43 @@ import { NotificationModel } from '../models/Notification.js';
 
 export const bootstrapRouter = Router();
 
+/** YYYY-MM-DD: only load attendance/behavior from this date onward (smaller payload). Override with BOOTSTRAP_HISTORY_DAYS (60–1095). */
+function getBootstrapHistoryMinDate(): string {
+  const raw = process.env.BOOTSTRAP_HISTORY_DAYS;
+  const parsed = raw != null && String(raw).trim() !== '' ? Number(raw) : NaN;
+  const days = Number.isFinite(parsed) ? Math.max(60, Math.min(1095, parsed)) : 548;
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() - days);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
 bootstrapRouter.use(requireAuth);
 bootstrapRouter.use(requireDb);
 
 bootstrapRouter.get('/', async (req: AuthedRequest, res, next) => {
   try {
     const isTeam = req.user?.role === 'team';
-    const isAdmin = req.user?.role === 'admin';
-    const isSuperAdmin = req.user?.role === 'super-admin';
+    const minDate = getBootstrapHistoryMinDate();
 
-    const me = await UserModel.findById(req.user!.id).lean();
-    const myBranch = (me as any)?.branch || '';
+    const attendanceQuery = isTeam
+      ? { userId: req.user!.id, date: { $gte: minDate } }
+      : { date: { $gte: minDate } };
+    const behaviorQuery = isTeam
+      ? { userId: req.user!.id, date: { $gte: minDate } }
+      : { date: { $gte: minDate } };
 
-    const taskQuery: any = {};
-    if (isTeam) taskQuery.$or = [{ assigneeId: req.user!.id }, { assignerId: req.user!.id }];
-    else if (isAdmin && myBranch) taskQuery.branch = myBranch;
-    // super-admin sees all tasks
-
-    const [usersRaw, tasksRaw, projectsRaw, attendanceRaw, leavesRaw, behaviorRaw, noticesRaw, branchConfigsRaw, projectConfigRaw, checklistTemplatesRaw, checklistProgressRaw, appSettingsRaw, notificationsRaw] = await Promise.all([
-      UserModel.find().lean(),
-      TaskModel.find(taskQuery).lean(),
+    // Tasks are loaded via GET /api/tasks so bootstrap stays smaller and faster to serialize.
+    const [usersRaw, projectsRaw, attendanceRaw, leavesRaw, behaviorRaw, noticesRaw, branchConfigsRaw, projectConfigRaw, checklistTemplatesRaw, checklistProgressRaw, appSettingsRaw, notificationsRaw] = await Promise.all([
+      UserModel.find().select('-passwordHash -twoFactorSecret').lean(),
       ProjectModel.find().lean(),
-      AttendanceModel.find(isTeam ? { userId: req.user!.id } : {}).lean(),
+      AttendanceModel.find(attendanceQuery).lean(),
       LeaveModel.find(isTeam ? { userId: req.user!.id } : {}).lean(),
-      BehaviorModel.find(isTeam ? { userId: req.user!.id } : {}).lean(),
-      NoticeModel.find().sort({ date: -1 }).lean(),
+      BehaviorModel.find(behaviorQuery).lean(),
+      NoticeModel.find().sort({ date: -1 }).limit(400).lean(),
       BranchConfigModel.find().lean(),
       ProjectConfigModel.findOne({ key: 'default' }).lean(),
       ChecklistTemplateModel.findOne({ key: 'default' }).lean(),
@@ -66,15 +77,6 @@ bootstrapRouter.get('/', async (req: AuthedRequest, res, next) => {
         });
       }
       return safe;
-    });
-
-    const tasks = tasksRaw.map((t: any) => {
-      const out: any = { ...t, id: String(t._id) };
-      delete out._id;
-      delete out.__v;
-      if (out.assignerId != null) out.assignerId = String(out.assignerId);
-      if (out.completedAt instanceof Date) out.completedAt = out.completedAt.toISOString();
-      return out;
     });
 
     const projects = projectsRaw.map((p: any) => {
@@ -186,7 +188,6 @@ bootstrapRouter.get('/', async (req: AuthedRequest, res, next) => {
 
     return res.json({
       users,
-      tasks,
       projects,
       attendanceRecords,
       leaves,

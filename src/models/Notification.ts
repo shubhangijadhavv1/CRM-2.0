@@ -2,6 +2,15 @@ import mongoose, { Schema } from 'mongoose';
 
 export type NotificationType = 'info' | 'alert' | 'success';
 
+export interface NotificationLink {
+  view: string;
+  taskId?: string;
+  projectId?: string;
+  leaveId?: string;
+  noticeId?: string;
+  userId?: string;
+}
+
 export interface NotificationDoc {
   id: string;
   userId: string; // receiver
@@ -10,6 +19,7 @@ export interface NotificationDoc {
   type: NotificationType;
   time: string;
   read: boolean;
+  link?: NotificationLink;
 }
 
 const NotificationSchema = new Schema<NotificationDoc>(
@@ -20,7 +30,8 @@ const NotificationSchema = new Schema<NotificationDoc>(
     message: { type: String, required: true },
     type: { type: String, required: true, enum: ['info', 'alert', 'success'] },
     time: { type: String, required: true },
-    read: { type: Boolean, default: false }
+    read: { type: Boolean, default: false },
+    link: { type: Schema.Types.Mixed }
   },
   { timestamps: true }
 );
