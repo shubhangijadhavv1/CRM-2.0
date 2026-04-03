@@ -15,6 +15,8 @@ import { BranchConfigModel } from '../models/BranchConfig.js';
 import { emitInvalidate } from '../realtime/invalidate.js';
 import { emitNotify } from '../realtime/notify.js';
 import { emitUserStatus } from '../realtime/io.js';
+import { computeAttendanceSummary, finalizeAttendanceRecord } from '../utils/attendanceMetrics.js';
+import { resolveCanonicalOpenSession } from '../utils/attendanceSession.js';
 
 export const activityRouter = Router();
 
@@ -30,7 +32,10 @@ async function pruneActivityLogs(userId: string, retentionDays?: number): Promis
     at: { $lt: new Date(Date.now() - days * 24 * 60 * 60 * 1000) }
   }).catch(() => {});
 }
-const idleAlertState = new Map<string, { openSince: string; lastAlertAt: number }>();
+const idleAlertState = new Map<string, { openSince: string; lastAlertAt: number; sentCount: number }>();
+const IDLE_ALERT_AFTER_MS = 30 * 1000;
+const IDLE_ALERT_RESEND_MS = 30 * 1000;
+const MAX_IDLE_ALERTS_PER_STREAK = 2;
 // Per-user blocked-keyword alert cooldown: don't spam alerts for the same keyword
 const keywordAlertCooldown = new Map<string, number>(); // key: `${userId}:${keyword}` → lastAlertAt ms
 const KEYWORD_ALERT_COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes between same-keyword alerts per user
@@ -42,10 +47,17 @@ function todayStr() {
   return new Date().toISOString().split('T')[0];
 }
 
-async function createAdminAlert(ruleKey: string, userId: string, message: string, details = '', severity: 'info' | 'warning' | 'critical' = 'warning') {
+async function createAdminAlert(
+  ruleKey: string,
+  userId: string,
+  message: string,
+  details = '',
+  severity: 'info' | 'warning' | 'critical' = 'warning',
+  recipientRoles: Array<'admin' | 'super-admin'> = ['admin', 'super-admin'],
+) {
   const id = `agent-alert-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   await AgentAlertModel.create({ id, userId, ruleKey, message, details, severity }).catch(() => {});
-  const admins = await UserModel.find({ role: { $in: ['admin', 'super-admin'] }, status: 'active' }).select('_id').lean();
+  const admins = await UserModel.find({ role: { $in: recipientRoles }, status: 'active' }).select('_id').lean();
   const now = new Date().toLocaleTimeString();
   if (admins.length > 0) {
     const rows = admins.map((u: any) => ({
@@ -91,10 +103,15 @@ activityRouter.post('/heartbeat', async (req: AuthedRequest, res, next) => {
   try {
     const body = req.body ?? {};
     const lastActivityAt = Number(body.lastActivityAt);
-    // Default 35s: faster idle visibility on admin dashboards; override with BROWSER_IDLE_AFTER_MS (ms).
+    const agentIdleSeconds = typeof body.idleSeconds === 'number' && Number.isFinite(body.idleSeconds) && body.idleSeconds >= 0 ? body.idleSeconds : null;
+    const isDesktopAgent = typeof body.crmOrigin === 'string' && body.crmOrigin === 'desktop-agent';
+    // Only the desktop agent (OS-level powerMonitor) is authoritative for idle detection.
+    // Browser heartbeats carry no idle signal.
     const serverIdleAfterMs = Math.max(5000, Number(process.env.BROWSER_IDLE_AFTER_MS) || 35000);
-    const serverIdleForMs = Math.max(0, Date.now() - lastActivityAt);
-    const serverIsIdle = serverIdleForMs >= serverIdleAfterMs;
+    const serverIdleForMs = isDesktopAgent && agentIdleSeconds !== null
+      ? agentIdleSeconds * 1000
+      : 0;
+    const serverIsIdle = isDesktopAgent && serverIdleForMs >= serverIdleAfterMs;
     const reason = typeof body.reason === 'string' ? body.reason : 'interval';
     const crmOrigin = typeof body.crmOrigin === 'string' ? body.crmOrigin : '';
     const extensionVersion = typeof body.extensionVersion === 'string' ? body.extensionVersion : '';
@@ -125,9 +142,7 @@ activityRouter.post('/heartbeat', async (req: AuthedRequest, res, next) => {
       status: serverIsIdle ? 'idle' : 'active',
       source: crmOrigin || 'browser'
     }).catch(() => {});
-    const attForAlert = await AttendanceModel.findOne({ userId: req.user!.id, date: todayStr(), checkOutTime: null })
-      .sort({ checkInTime: -1 })
-      .lean();
+    const attForAlert = await resolveCanonicalOpenSession(req.user!.id, todayStr());
     const userRole = String((updated as any)?.role || '');
     const isAdminRole = userRole === 'super-admin' || userRole === 'admin';
     const isBreakMode = String((attForAlert as any)?.dailyStatus || '').includes('break');
@@ -139,32 +154,33 @@ activityRouter.post('/heartbeat', async (req: AuthedRequest, res, next) => {
       // Never keep stale alert state for users that should not generate idle alerts.
       idleAlertState.delete(req.user!.id);
     } else {
-      const policy = await getAgentPolicy();
-      const idleAlertMinutes = Math.max(1, Number(policy.idleAlertMinutes) || 20);
-      const idleAlertMs = idleAlertMinutes * 60 * 1000;
-      if (serverIdleForMs >= idleAlertMs) {
+      if (serverIdleForMs >= IDLE_ALERT_AFTER_MS) {
         const openIdle = (attForAlert as any)?.idleIntervals?.find((i: any) => !i.endTime);
         const openSince = String(openIdle?.startTime || (attForAlert as any)?.checkInTime || '');
         const nowTs = Date.now();
         const existing = idleAlertState.get(req.user!.id);
-        const resendMs = 60 * 60 * 1000; // At most once per hour for same idle streak.
+        let state =
+          !existing || existing.openSince !== openSince
+            ? { openSince, lastAlertAt: 0, sentCount: 0 }
+            : existing;
         const shouldAlert =
-          !existing ||
-          existing.openSince !== openSince ||
-          nowTs - existing.lastAlertAt >= resendMs;
+          state.sentCount < MAX_IDLE_ALERTS_PER_STREAK &&
+          (state.lastAlertAt === 0 || nowTs - state.lastAlertAt >= IDLE_ALERT_RESEND_MS);
 
         if (shouldAlert) {
           const user = await UserModel.findById(req.user!.id).select('name').lean();
-          const mins = Math.floor(serverIdleForMs / 60000);
+          const secs = Math.floor(serverIdleForMs / 1000);
           await createAdminAlert(
             'idle-threshold',
             req.user!.id,
-            `${(user as any)?.name || 'Staff'} is idle for ${mins} minutes.`,
-            `Idle duration crossed threshold (${idleAlertMinutes}m).`,
-            mins >= idleAlertMinutes * 2 ? 'critical' : 'warning'
+            `${(user as any)?.name || 'Staff'} is idle for ${secs} seconds.`,
+            `Idle duration crossed threshold (30s).`,
+            secs >= 60 ? 'critical' : 'warning',
+            ['super-admin']
           );
-          idleAlertState.set(req.user!.id, { openSince, lastAlertAt: nowTs });
+          state = { ...state, lastAlertAt: nowTs, sentCount: state.sentCount + 1 };
         }
+        idleAlertState.set(req.user!.id, state);
       }
     }
     // Prune old activity logs using policy retention days (not hardcoded)
@@ -175,47 +191,126 @@ activityRouter.post('/heartbeat', async (req: AuthedRequest, res, next) => {
     // This makes "Idle" visible to admins even when CRM tab isn't open.
     // Only applies to active sessions (checkOutTime is null) and does not override breaks.
     const today = new Date().toISOString().split('T')[0];
-    const att = await AttendanceModel.findOne({ userId: req.user!.id, date: today, checkOutTime: null })
-      .sort({ checkInTime: -1 })
-      .lean();
+    let att = await resolveCanonicalOpenSession(req.user!.id, today);
+    const lastAgentLoginMs = (updated as any)?.lastAgentLoginAt ? new Date((updated as any).lastAgentLoginAt).getTime() : 0;
+    const lastAgentLogoutMs = (updated as any)?.lastAgentLogoutAt ? new Date((updated as any).lastAgentLogoutAt).getTime() : 0;
+    const agentSessionActive = lastAgentLoginMs > 0 && lastAgentLoginMs >= lastAgentLogoutMs;
+    if (!att && crmOrigin === 'desktop-agent' && agentSessionActive) {
+      const user = await UserModel.findById(req.user!.id).select('name branch').lean();
+      const created = await AttendanceModel.create({
+        id: `agent-hb-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+        userId: req.user!.id,
+        userName: String((user as any)?.name || 'Staff'),
+        date: today,
+        branch: String((user as any)?.branch || 'Main'),
+        mode: 'office',
+        checkInTime: new Date().toISOString(),
+        checkOutTime: null,
+        ipAddress: '',
+        isLate: false,
+        breaks: [],
+        idleIntervals: [],
+        idleMinutes: 0,
+        totalWorkMinutes: 0,
+        status: 'present',
+        dailyStatus: 'checked-in',
+      });
+      att = (created as any).toObject ? (created as any).toObject() : (created as any);
+    }
 
-    if (att && att.dailyStatus !== 'checked-out' && att.dailyStatus !== 'lunch-break' && att.dailyStatus !== 'tea-break') {
+    // Only desktop agent heartbeats update idle intervals — browser heartbeats carry no idle signal.
+    if (isDesktopAgent && att && att.dailyStatus !== 'checked-out' && att.dailyStatus !== 'lunch-break' && att.dailyStatus !== 'tea-break') {
       const idleIntervals = Array.isArray(att.idleIntervals) ? att.idleIntervals.map((i: any) => ({ ...i })) : [];
       const openIdx = idleIntervals.findIndex((i: any) => i.endTime === null);
 
       // When idle starts, it effectively begins at lastActivityAt + threshold.
-      const idleStartMs = lastActivityAt + serverIdleAfterMs;
-      const idleStartIso = new Date(Math.min(idleStartMs, Date.now())).toISOString();
-      const activeIso = new Date(lastActivityAt).toISOString();
+      // Clamp to check-in time so pre-login activity never inflates idle.
+      const checkInMs = att.checkInTime ? new Date(att.checkInTime as string).getTime() : 0;
+      const nowTs = Date.now();
+      // Idle starts at lastActivityAt + threshold, clamped to [checkInTime, now]
+      // This ensures idle never starts before check-in or in the future
+      const rawIdleStartMs = lastActivityAt + serverIdleAfterMs;
+      const clampedIdleStartMs = Math.min(Math.max(rawIdleStartMs, checkInMs > 0 ? checkInMs : rawIdleStartMs), nowTs);
+      const idleStartIso = new Date(clampedIdleStartMs).toISOString();
+      // activeIso = when user resumed activity, clamped to after check-in
+      const activeIso = new Date(Math.max(lastActivityAt, checkInMs > 0 ? checkInMs : lastActivityAt)).toISOString();
 
       if (serverIsIdle) {
+        // Only open a new interval if none is open already
         if (openIdx === -1) {
           idleIntervals.push({ startTime: idleStartIso, endTime: null, deducted: false });
         }
-        const nextDailyStatus = 'idle';
-        await AttendanceModel.findOneAndUpdate(
+        const updatedAtt = await AttendanceModel.findOneAndUpdate(
           { id: att.id },
-          { $set: { idleIntervals, dailyStatus: nextDailyStatus } },
-          { new: false }
+          { $set: { idleIntervals, dailyStatus: 'idle' } },
+          { new: true }
         );
-      } else {
-        // Activity detected — ALWAYS set dailyStatus back to 'checked-in'
-        const updatePatch: any = { dailyStatus: 'checked-in' };
-        if (openIdx !== -1) {
-          const startMs = new Date(idleIntervals[openIdx].startTime).getTime();
-          const endMs = new Date(activeIso).getTime();
-          const durationMs = Math.max(0, endMs - startMs);
-          const deducted = true; // Always count idle time, regardless of duration
-          idleIntervals[openIdx] = { ...idleIntervals[openIdx], endTime: activeIso, deducted };
-          const addMinutes = Math.floor(durationMs / 60000);
-          updatePatch.idleIntervals = idleIntervals;
-          updatePatch.idleMinutes = (Number(att.idleMinutes) || 0) + addMinutes;
+        if (updatedAtt) {
+          const branchId = String((updatedAtt as any).branch || '');
+          const branchConfig = branchId ? await BranchConfigModel.findOne({ $or: [{ id: branchId }, { name: branchId }] }).lean() : null;
+          const summary = computeAttendanceSummary({
+            record: updatedAtt as any,
+            branchConfig: branchConfig || undefined,
+            nowMs: Date.now(),
+          });
+          await AttendanceModel.findOneAndUpdate(
+            { id: att.id },
+            {
+              $set: {
+                totalWorkMinutes: Math.max(Number((updatedAtt as any).totalWorkMinutes || 0), Math.floor(summary.workMs / 60000)),
+                idleMinutes: Math.max(Number((updatedAtt as any).idleMinutes || 0), Math.floor(summary.idleMs / 60000)),
+              }
+            },
+            { new: false }
+          );
         }
-        await AttendanceModel.findOneAndUpdate(
+      } else {
+        // Activity detected — close ALL open idle intervals (not just index 0) to prevent
+        // stale open intervals from accumulating and inflating idle time indefinitely.
+        const updatePatch: any = { dailyStatus: att.dailyStatus === 'background' ? 'background' : 'checked-in' };
+        let hadOpenInterval = false;
+        idleIntervals.forEach((iv: any, idx: number) => {
+          if (iv.endTime === null) {
+            hadOpenInterval = true;
+            idleIntervals[idx] = { ...iv, endTime: activeIso, deducted: true };
+          }
+        });
+        if (hadOpenInterval) {
+          // Recompute idleMinutes from all closed intervals clamped to checkInTime
+          let recomputedIdleMs = 0;
+          idleIntervals.forEach((iv: any) => {
+            if (!iv.endTime) return;
+            const ivStart = checkInMs > 0 ? Math.max(new Date(iv.startTime).getTime(), checkInMs) : new Date(iv.startTime).getTime();
+            const ivEnd = new Date(iv.endTime).getTime();
+            if (ivEnd > ivStart) recomputedIdleMs += ivEnd - ivStart;
+          });
+          updatePatch.idleIntervals = idleIntervals;
+          updatePatch.idleMinutes = Math.floor(recomputedIdleMs / 60000);
+        }
+        const updatedAtt = await AttendanceModel.findOneAndUpdate(
           { id: att.id },
           { $set: updatePatch },
-          { new: false }
+          { new: true }
         );
+        if (updatedAtt) {
+          const branchId = String((updatedAtt as any).branch || '');
+          const branchConfig = branchId ? await BranchConfigModel.findOne({ $or: [{ id: branchId }, { name: branchId }] }).lean() : null;
+          const summary = computeAttendanceSummary({
+            record: updatedAtt as any,
+            branchConfig: branchConfig || undefined,
+            nowMs: Date.now(),
+          });
+          await AttendanceModel.findOneAndUpdate(
+            { id: att.id },
+            {
+              $set: {
+                totalWorkMinutes: Math.max(Number((updatedAtt as any).totalWorkMinutes || 0), Math.floor(summary.workMs / 60000)),
+                idleMinutes: Math.max(Number((updatedAtt as any).idleMinutes || 0), Math.floor(summary.idleMs / 60000)),
+              }
+            },
+            { new: false }
+          );
+        }
       }
     }
 
@@ -259,7 +354,7 @@ activityRouter.post('/agent-login', async (req: AuthedRequest, res, next) => {
     });
 
     const date = todayStr();
-    const openRecord = await AttendanceModel.findOne({ userId: req.user!.id, date, checkOutTime: null }).sort({ checkInTime: -1 }).lean();
+    const openRecord = await resolveCanonicalOpenSession(req.user!.id, date);
     if (!openRecord) {
       const branch = String((user as any).branch || 'Main');
       await AttendanceModel.create({
@@ -280,10 +375,10 @@ activityRouter.post('/agent-login', async (req: AuthedRequest, res, next) => {
         status: 'present',
         dailyStatus: 'checked-in'
       });
-    } else if (openRecord.dailyStatus === 'checked-out') {
+    } else if (!openRecord.checkInTime || openRecord.dailyStatus === 'checked-out') {
       await AttendanceModel.findOneAndUpdate(
         { id: openRecord.id },
-        { $set: { dailyStatus: 'checked-in', checkOutTime: null } },
+        { $set: { dailyStatus: 'checked-in', checkOutTime: null, checkInTime: openRecord.checkInTime || now.toISOString() } },
         { new: false }
       );
     }
@@ -341,64 +436,19 @@ activityRouter.post('/agent-logout', async (req: AuthedRequest, res, next) => {
       }
     });
     const date = todayStr();
-    const openRecord = await AttendanceModel.findOne({ userId, date, checkOutTime: null }).sort({ checkInTime: -1 }).lean();
+    const openRecord = await resolveCanonicalOpenSession(userId, date);
     if (openRecord?.id) {
-      const nowMs = now.getTime();
-      const idleIntervals = Array.isArray(openRecord.idleIntervals) ? openRecord.idleIntervals.map((i: any) => ({ ...i })) : [];
-      const breaks = Array.isArray(openRecord.breaks) ? openRecord.breaks.map((b: any) => ({ ...b })) : [];
-
-      // Close any open idle interval
-      let finalIdleMinutes = Number(openRecord.idleMinutes) || 0;
-      const openIdleIdx = idleIntervals.findIndex((i: any) => i.endTime === null);
-      if (openIdleIdx !== -1) {
-        const duration = nowMs - new Date(idleIntervals[openIdleIdx].startTime).getTime();
-        const deducted = true; // Always count idle time
-        idleIntervals[openIdleIdx] = { ...idleIntervals[openIdleIdx], endTime: now.toISOString(), deducted };
-        finalIdleMinutes += Math.floor(duration / 60000);
-      }
-
-      // Close any open break
-      const openBreakIdx = breaks.findIndex((b: any) => b.endTime === null);
-      if (openBreakIdx !== -1) {
-        breaks[openBreakIdx] = { ...breaks[openBreakIdx], endTime: now.toISOString() };
-      }
-
-      // Compute totalWorkMinutes: session - breaks(capped) - idle - excessBreak
-      let totalWorkMinutes = 0;
-      if (openRecord.checkInTime) {
-        const checkInMs = new Date(openRecord.checkInTime).getTime();
-        const totalSessionMs = nowMs - checkInMs;
-
-        const branchId = String(openRecord.branch || '');
-        const branchConfig = branchId ? await BranchConfigModel.findOne({ $or: [{ id: branchId }, { name: branchId }] }).lean() : null;
-        const lunchTimeLimit = Number((branchConfig as any)?.lunchTimeLimitMinutes) || 30;
-        const teaBreakTimeLimit = Number((branchConfig as any)?.teaBreakTimeLimitMinutes) || 15;
-
-        let allowedBreakMs = 0;
-        let excessBreakMs = 0;
-        breaks.forEach((b: any) => {
-          const bStart = new Date(b.startTime).getTime();
-          const bEnd = b.endTime ? new Date(b.endTime).getTime() : nowMs;
-          const durationMin = Math.floor((bEnd - bStart) / 60000);
-          const limit = b.type === 'lunch' ? lunchTimeLimit : teaBreakTimeLimit;
-          allowedBreakMs += Math.min(durationMin, limit) * 60000;
-          if (durationMin > limit) excessBreakMs += (durationMin - limit) * 60000;
-        });
-
-        const totalIdleMs = finalIdleMinutes * 60000;
-        totalWorkMinutes = Math.max(0, Math.floor((totalSessionMs - allowedBreakMs - totalIdleMs - excessBreakMs) / 60000));
-      }
+      const branchId = String(openRecord.branch || '');
+      const branchConfig = branchId ? await BranchConfigModel.findOne({ $or: [{ id: branchId }, { name: branchId }] }).lean() : null;
+      const finalized = finalizeAttendanceRecord({
+        record: openRecord as any,
+        branchConfig: branchConfig || undefined,
+        nowMs,
+      });
 
       await AttendanceModel.findOneAndUpdate(
         { id: openRecord.id },
-        { $set: {
-          checkOutTime: now.toISOString(),
-          dailyStatus: 'checked-out',
-          idleIntervals,
-          breaks,
-          idleMinutes: finalIdleMinutes,
-          totalWorkMinutes
-        } },
+        { $set: finalized },
         { new: false }
       );
     }

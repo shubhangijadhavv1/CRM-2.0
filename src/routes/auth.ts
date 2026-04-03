@@ -234,13 +234,24 @@ authRouter.post('/2fa/challenge', requireDb, async (req, res) => {
 
     const hash = (user as any).passwordHash;
     if (!hash || typeof hash !== 'string') return res.status(500).json({ error: 'Server misconfiguration: user account missing password. Contact admin.' });
-    const ok = await bcrypt.compare(password, hash);
+    let ok = false;
+    try {
+      ok = await bcrypt.compare(password, hash);
+    } catch {
+      return res.status(401).json({ error: 'Invalid email or password.' });
+    }
     if (!ok) return res.status(401).json({ error: 'Invalid email or password.' });
 
     const ipError = await validateUserIpForTeamOnly(user, req);
     if (ipError) return res.status(403).json({ error: ipError });
 
     const role = String((user as any).role || '');
+    // Super-admin never uses the 2FA ticket flow on web login; skip QR/setup work entirely.
+    // Otherwise a failure in speakeasy/qrcode would block login even though the client ignores this payload.
+    if (role === 'super-admin') {
+      return res.json({ requiresSetup: false, role });
+    }
+
     if ((user as any).twoFactorEnabled && (user as any).twoFactorSecret) {
       return res.json({ requiresSetup: false, role });
     }
@@ -364,8 +375,13 @@ authRouter.post('/login', requireDb, async (req, res, next) => {
     const hash = (user as any).passwordHash;
     if (!hash || typeof hash !== 'string') return res.status(500).json({ error: 'Server misconfiguration: user account missing password. Contact admin.' });
 
-    const ok = await bcrypt.compare(String(password), hash);
-    if (!ok) return res.status(401).json({ error: 'Invalid email or password.' });
+    let passwordOk = false;
+    try {
+      passwordOk = await bcrypt.compare(String(password), hash);
+    } catch {
+      return res.status(401).json({ error: 'Invalid email or password.' });
+    }
+    if (!passwordOk) return res.status(401).json({ error: 'Invalid email or password.' });
 
     const ipError = await validateUserIpForTeamOnly(user, req);
     if (ipError) return res.status(403).json({ error: ipError });
@@ -395,8 +411,13 @@ authRouter.post('/agent-login', requireDb, async (req, res) => {
     const hash = (user as any).passwordHash;
     if (!hash || typeof hash !== 'string') return res.status(500).json({ error: 'Server misconfiguration: user account missing password. Contact admin.' });
 
-    const ok = await bcrypt.compare(String(password), hash);
-    if (!ok) return res.status(401).json({ error: 'Invalid email or password.' });
+    let passwordOk = false;
+    try {
+      passwordOk = await bcrypt.compare(String(password), hash);
+    } catch {
+      return res.status(401).json({ error: 'Invalid email or password.' });
+    }
+    if (!passwordOk) return res.status(401).json({ error: 'Invalid email or password.' });
 
     const ipError = await validateUserIpForTeamOnly(user, req);
     if (ipError) return res.status(403).json({ error: ipError });

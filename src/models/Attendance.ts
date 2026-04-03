@@ -7,12 +7,13 @@ export interface AttendanceDoc {
   date: string; // YYYY-MM-DD
   branch: string;
   mode: 'office' | 'wfh';
-  checkInTime: string | null;
-  checkOutTime: string | null;
+  checkInTime: string | null; // first session check-in (never changes)
+  checkOutTime: string | null; // last session check-out (null when active)
   ipAddress: string;
   isLate: boolean;
   lateReason?: string;
   breaks: { type: 'lunch' | 'tea'; startTime: string; endTime: string | null }[];
+  sessions?: { checkIn: string; checkOut: string | null }[]; // multi-session support
   idleIntervals: { startTime: string; endTime: string | null; deducted: boolean }[];
   idleMinutes: number;
   totalWorkMinutes: number;
@@ -42,6 +43,15 @@ const AttendanceSchema = new Schema<AttendanceDoc>(
         }
       ],
       default: []
+    },
+    sessions: {
+      type: [
+        {
+          checkIn: { type: String, required: true },
+          checkOut: { type: String, default: null }
+        }
+      ],
+      default: undefined
     },
     idleIntervals: {
       type: [

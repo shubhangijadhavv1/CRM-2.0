@@ -8,7 +8,10 @@
     "start": "tsx src/server.ts",
     "seed": "tsx src/seed/seed.ts",
     "purge-demo": "tsx src/scripts/purgeDemo.ts",
-    "clear-project-config": "tsx src/scripts/clearProjectConfig.ts"
+    "reset-today-attendance": "tsx src/scripts/resetTodayAttendance.ts",
+    "clear-project-config": "tsx src/scripts/clearProjectConfig.ts",
+    "reconcile-attendance": "tsx src/scripts/reconcileDuplicateAttendanceSessions.ts",
+    "verify-attendance-consistency": "tsx src/scripts/verifyAttendanceConsistency.ts"
   },
   "dependencies": {
     "@google/genai": "^1.34.0",
