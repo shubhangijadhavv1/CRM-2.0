@@ -17,6 +17,7 @@ export interface UserDoc {
   loginLocked?: boolean;
   privacyModeEnabled?: boolean;
   idleTrackingEnabled?: boolean;
+  screenshotEnabled?: boolean; // per-user override: true=force on, false=force off, undefined=follow global policy
   avatar?: string;
   allowedIps?: string[]; // per-user allowlist (exact match), enforced on login if set
 
@@ -70,6 +71,7 @@ const UserSchema = new Schema<UserDoc>(
     loginLocked: { type: Boolean, default: false },
     privacyModeEnabled: { type: Boolean, default: false },
     idleTrackingEnabled: { type: Boolean, default: true },
+    screenshotEnabled: { type: Boolean }, // no default — absence means "follow global policy"
     avatar: { type: String },
     allowedIps: { type: [String], default: [] },
 

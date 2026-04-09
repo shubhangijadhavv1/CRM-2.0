@@ -3,6 +3,7 @@ import mongoose from 'mongoose';
 import { requireAuth, requireRole, type AuthedRequest } from '../middleware/auth.js';
 import { requireDb } from '../middleware/db.js';
 import { AppSettingsModel } from '../models/AppSettings.js';
+import { UserModel } from '../models/User.js';
 import { emitInvalidate } from '../realtime/invalidate.js';
 import { AuditLogModel } from '../models/AuditLog.js';
 
@@ -57,7 +58,47 @@ appSettingsRouter.get('/', async (_req, res, next) => {
         retentionDays:         Math.max(1, Number(p.retentionDays) || 7),
       }
     };
+    // Merge per-user screenshot override so the agent gets the right value for this user
+    const reqUser = (_req as AuthedRequest).user;
+    if (reqUser?.id) {
+      const userDoc = await UserModel.findById(reqUser.id).select('screenshotEnabled').lean() as any;
+      if (typeof userDoc?.screenshotEnabled === 'boolean') {
+        out.agentPolicy.screenshotEnabled = userDoc.screenshotEnabled;
+      }
+    }
     return res.json({ appSettings: out });
+  } catch (e) {
+    return next(e);
+  }
+});
+
+// PUT /api/app-settings/user-screenshot — admin sets per-user screenshot toggle
+appSettingsRouter.put('/user-screenshot', requireRole(['super-admin', 'admin']), async (req: AuthedRequest, res, next) => {
+  try {
+    const { userId, screenshotEnabled } = req.body || {};
+    if (!userId || typeof screenshotEnabled !== 'boolean') {
+      return res.status(400).json({ error: 'userId and screenshotEnabled (boolean) are required' });
+    }
+    // Use explicit boolean cast to avoid Mongoose type coercion issues
+    const boolVal = screenshotEnabled === true;
+    const user = await UserModel.findByIdAndUpdate(
+      userId,
+      { $set: { screenshotEnabled: boolVal } },
+      { new: true, strict: true }
+    ).select('name screenshotEnabled').lean() as any;
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    // Verify the value was actually persisted — if Mongoose silently dropped it, fix it
+    const savedVal = user.screenshotEnabled;
+    console.log(`[screenshot-toggle] userId=${userId} requested=${boolVal} saved=${savedVal}`);
+    await AuditLogModel.create({
+      id: `audit-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      actorUserId: req.user!.id,
+      action: 'user_screenshot_toggle',
+      targetUserId: userId,
+      metadata: JSON.stringify({ screenshotEnabled: boolVal, savedVal }).slice(0, 4000)
+    }).catch(() => {});
+    emitInvalidate('activity');
+    return res.json({ ok: true, userId, screenshotEnabled: savedVal });
   } catch (e) {
     return next(e);
   }

@@ -353,6 +353,79 @@ attendanceRouter.get('/:id', async (req: AuthedRequest, res, next) => {
   }
 });
 
+// Super-admin manual override — works for any date (backdate or today)
+// POST body: { userId, date, isLate, lateReason, status, dailyStatus }
+// If no record exists for that user+date, creates one. Otherwise patches it.
+attendanceRouter.post('/admin-override', async (req: AuthedRequest, res, next) => {
+  try {
+    if (req.user?.role !== 'super-admin') return res.status(403).json({ error: 'Super-admin only' });
+
+    const { userId, date, isLate, lateReason, status, dailyStatus, mode, idleMinutes, checkInTime, checkOutTime } = req.body ?? {};
+    if (!userId || !date) return res.status(400).json({ error: 'userId and date are required' });
+
+    const user = await UserModel.findById(userId).lean();
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const patch: any = {};
+    if (isLate !== undefined) patch.isLate = Boolean(isLate);
+    if (lateReason !== undefined) patch.lateReason = String(lateReason || '');
+    if (status !== undefined) patch.status = status;
+    if (dailyStatus !== undefined) patch.dailyStatus = dailyStatus;
+    if (mode !== undefined && ['office', 'wfh'].includes(mode)) patch.mode = mode;
+    if (idleMinutes !== undefined && Number.isFinite(Number(idleMinutes))) patch.idleMinutes = Math.max(0, Number(idleMinutes));
+    if (checkInTime !== undefined && typeof checkInTime === 'string' && checkInTime) patch.checkInTime = checkInTime;
+    if (checkOutTime !== undefined && typeof checkOutTime === 'string' && checkOutTime) {
+      patch.checkOutTime = checkOutTime;
+      // Auto-set dailyStatus to checked-out when checkOutTime is provided (unless caller overrides)
+      if (dailyStatus === undefined) patch.dailyStatus = 'checked-out';
+    } else if (checkInTime !== undefined && typeof checkInTime === 'string' && checkInTime && dailyStatus === undefined) {
+      // Auto-set dailyStatus to checked-in when only checkInTime is provided
+      patch.dailyStatus = 'checked-in';
+    }
+
+    // Try to find existing record for this user+date
+    const existing = await AttendanceModel.findOne({ userId, date }).lean();
+
+    let result: any;
+    if (existing) {
+      result = await AttendanceModel.findOneAndUpdate(
+        { userId, date },
+        { $set: patch },
+        { new: true }
+      ).lean();
+    } else {
+      // Create a minimal record for the backdate
+      result = await AttendanceModel.create({
+        id: `override-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        userId,
+        userName: String((user as any).name || 'Staff'),
+        date,
+        branch: String((user as any).branch || 'Main'),
+        mode: patch.mode || 'office',
+        checkInTime: patch.checkInTime || null,
+        checkOutTime: patch.checkOutTime || null,
+        ipAddress: 'manual-override',
+        isLate: Boolean(patch.isLate ?? false),
+        lateReason: patch.lateReason || '',
+        breaks: [],
+        idleIntervals: [],
+        idleMinutes: patch.idleMinutes ?? 0,
+        totalWorkMinutes: 0,
+        status: patch.status || 'absent',
+        dailyStatus: patch.checkOutTime ? 'checked-out' : patch.checkInTime ? 'checked-in' : 'offline',
+      });
+    }
+
+    const out: any = { ...(result?.toObject ? result.toObject() : result) };
+    delete out._id;
+    delete out.__v;
+    emitInvalidate('attendance');
+    return res.json({ attendanceRecord: out });
+  } catch (e) {
+    return next(e);
+  }
+});
+
 attendanceRouter.put('/:id', async (req: AuthedRequest, res, next) => {
   try {
     const id = req.params.id;

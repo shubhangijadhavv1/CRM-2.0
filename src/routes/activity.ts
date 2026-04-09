@@ -17,6 +17,7 @@ import { emitNotify } from '../realtime/notify.js';
 import { emitUserStatus } from '../realtime/io.js';
 import { computeAttendanceSummary, finalizeAttendanceRecord } from '../utils/attendanceMetrics.js';
 import { resolveCanonicalOpenSession } from '../utils/attendanceSession.js';
+import { shiftStartPlusGraceUtcMs } from '../utils/shiftDeadline.js';
 
 export const activityRouter = Router();
 
@@ -40,8 +41,8 @@ const MAX_IDLE_ALERTS_PER_STREAK = 2;
 const keywordAlertCooldown = new Map<string, number>(); // key: `${userId}:${keyword}` → lastAlertAt ms
 const KEYWORD_ALERT_COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes between same-keyword alerts per user
 
-// Max base64 size accepted (~300 KB decoded) to protect MongoDB from oversized screenshots
-const SCREENSHOT_MAX_B64_CHARS = 450_000; // ~337 KB decoded PNG/JPEG
+// Max base64 size accepted (~1 MB decoded) to support 1280×720 JPEG quality 85
+const SCREENSHOT_MAX_B64_CHARS = 1_500_000; // ~1.1 MB decoded JPEG
 
 function todayStr() {
   return new Date().toISOString().split('T')[0];
@@ -357,6 +358,28 @@ activityRouter.post('/agent-login', async (req: AuthedRequest, res, next) => {
     const openRecord = await resolveCanonicalOpenSession(req.user!.id, date);
     if (!openRecord) {
       const branch = String((user as any).branch || 'Main');
+      const checkInTime = now.toISOString();
+
+      // Compute late mark the same way the web check-in does
+      let isLate = false;
+      try {
+        const bc = await BranchConfigModel.findOne({
+          $or: [{ id: branch }, { name: branch }]
+        }).lean();
+        if (bc?.startTime) {
+          const expectedMs = shiftStartPlusGraceUtcMs(
+            date,
+            String(bc.startTime),
+            Number((bc as any).lateMarkGraceMinutes) || 0,
+          );
+          if (expectedMs != null) {
+            isLate = now.getTime() > expectedMs;
+          }
+        }
+      } catch {
+        // fall back to false if branch config unavailable
+      }
+
       await AttendanceModel.create({
         id: `agent-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
         userId: req.user!.id,
@@ -364,10 +387,10 @@ activityRouter.post('/agent-login', async (req: AuthedRequest, res, next) => {
         date,
         branch,
         mode: 'office',
-        checkInTime: now.toISOString(),
+        checkInTime,
         checkOutTime: null,
         ipAddress: '',
-        isLate: false,
+        isLate,
         breaks: [],
         idleIntervals: [],
         idleMinutes: 0,
@@ -571,7 +594,12 @@ activityRouter.post('/window-events', async (req: AuthedRequest, res, next) => {
 activityRouter.post('/screenshots', async (req: AuthedRequest, res, next) => {
   try {
     const policy = await getAgentPolicy();
-    if (!policy.screenshotEnabled) return res.json({ ok: true, stored: false, skipped: 'screenshotDisabled' });
+    // Per-user override takes priority over global policy
+    const userDoc = await UserModel.findById(req.user!.id).select('screenshotEnabled').lean() as any;
+    const userOverride = userDoc?.screenshotEnabled;  // boolean or undefined
+    const screenshotAllowed = typeof userOverride === 'boolean' ? userOverride : policy.screenshotEnabled;
+    console.log(`[screenshot-post] userId=${req.user!.id} userOverride=${userOverride} globalPolicy=${policy.screenshotEnabled} allowed=${screenshotAllowed}`);
+    if (!screenshotAllowed) return res.json({ ok: true, stored: false, skipped: 'screenshotDisabled' });
 
     const imageDataUrl = typeof req.body?.imageDataUrl === 'string' ? req.body.imageDataUrl : '';
     if (!imageDataUrl.startsWith('data:image/')) {
@@ -581,7 +609,7 @@ activityRouter.post('/screenshots', async (req: AuthedRequest, res, next) => {
     // Reject screenshots that are too large to protect MongoDB storage
     if (imageDataUrl.length > SCREENSHOT_MAX_B64_CHARS) {
       return res.status(413).json({
-        error: 'Screenshot too large. Reduce capture resolution or quality on the agent.',
+        error: 'Screenshot too large. Max ~1 MB per image.',
         maxChars: SCREENSHOT_MAX_B64_CHARS,
         receivedChars: imageDataUrl.length
       });
@@ -661,7 +689,7 @@ activityRouter.get('/window-events', requireRole(['admin', 'super-admin']), asyn
 activityRouter.get('/screenshots', requireRole(['admin', 'super-admin']), async (req: AuthedRequest, res, next) => {
   try {
     const userId = typeof req.query.userId === 'string' ? req.query.userId : undefined;
-    const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 20));
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
     const withImage = req.query.withImage === '1';
     const q: any = {};
     if (userId) q.userId = userId;
@@ -701,9 +729,9 @@ activityRouter.get('/screenshots/:id/image', requireRole(['admin', 'super-admin'
     const shot = await AgentScreenshotModel.findById(req.params.id).select('imageDataUrl mimeType userId').lean() as any;
     if (!shot) return res.status(404).json({ error: 'Screenshot not found' });
     // Return as proper image response to save bandwidth (no JSON wrapper)
-    const base64 = String(shot.imageDataUrl || '');
-    const match = base64.match(/^data:(image\/[a-z+]+);base64,(.+)$/);
-    if (!match) return res.status(422).json({ error: 'Invalid image data' });
+    const base64 = String(shot.imageDataUrl || '').trim();
+    const match = base64.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/s);
+    if (!match) return res.status(422).json({ error: 'Invalid image data stored for this screenshot' });
     const buf = Buffer.from(match[2], 'base64');
     res.set('Content-Type', match[1]);
     res.set('Content-Length', String(buf.length));
