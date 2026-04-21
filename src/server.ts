@@ -35,6 +35,8 @@ import mongoose from 'mongoose';
 import { ensureInitialSuperAdmin } from './config/initialSuperAdmin.js';
 import { initIo } from './realtime/io.js';
 import { configureWebPush } from './realtime/webpush.js';
+import * as attendanceUtils from './utils/attendanceSession.js';
+import { AttendanceModel } from './models/Attendance.js';
 
 const app = express();
 const httpServer = createServer(app);
@@ -224,14 +226,32 @@ async function start() {
     // eslint-disable-next-line no-console
     console.log('[api] MongoDB connected');
     await ensureInitialSuperAdmin();
+    // Start background auto-checkout job (scans periodically to catch those who closed their agents/browsers)
+    setInterval(async () => {
+      try {
+        const today = attendanceUtils.getLocalTodayStr();
+        const openRecords = await AttendanceModel.find({
+          date: today,
+          dailyStatus: { $ne: 'checked-out' }
+        });
+        const nowMs = Date.now();
+        for (const rec of openRecords) {
+           // This will checkout anyone who hit their target hours even if they are offline
+           await attendanceUtils.maybeAutoCheckout(rec as any, nowMs);
+        }
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.error('[auto-checkout] job failed', e);
+      }
+    }, 15 * 60 * 1000); // Every 15 minutes
   }
 
   initIo(httpServer, [...socketAllowedOrigins]);
   configureWebPush();
 
-  httpServer.listen(port, () => {
+  httpServer.listen(port, '0.0.0.0', () => {
     // eslint-disable-next-line no-console
-    console.log(`[api] listening on http://localhost:${port}`);
+    console.log(`[api] listening on http://0.0.0.0:${port}`);
   });
 }
 

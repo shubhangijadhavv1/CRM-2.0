@@ -82,27 +82,40 @@ function computeBreakTotals(
   let allowedBreakMs = 0;
   let excessBreakMs = 0;
 
-  (breaks || []).forEach((b) => {
-    const start = new Date(b.startTime).getTime();
-    // Only use nowMs for open breaks when status confirms employee is on break.
-    // Prevents break timer running after break ends but before server closes the entry.
-    const end = b.endTime
-      ? new Date(b.endTime).getTime()
-      : isOnBreak ? nowMs : start;
-    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return;
+  const rawBreaks = (breaks || []).filter(b => b.startTime).map(b => {
+    const bStart = new Date(b.startTime).getTime();
+    const bEnd = b.endTime ? new Date(b.endTime).getTime() : (isOnBreak ? nowMs : bStart);
+    return { type: b.type, start: bStart, end: bEnd };
+  }).filter(b => b.end > b.start).sort((a, b) => a.start - b.start);
 
-    const durationMs = end - start;
-    if (b.type === 'lunch') {
-      lunchWallMs += durationMs;
-      const capMs = Math.max(0, lunchLimitMinutes) * 60000;
-      allowedBreakMs += Math.min(durationMs, capMs);
-      if (durationMs > capMs) excessBreakMs += durationMs - capMs;
-    } else if (b.type === 'tea') {
-      teaWallMs += durationMs;
-      const capMs = Math.max(0, teaLimitMinutes) * 60000;
-      allowedBreakMs += Math.min(durationMs, capMs);
-      if (durationMs > capMs) excessBreakMs += durationMs - capMs;
+  // Group by type and merge
+  const lunchRanges: { start: number; end: number }[] = [];
+  const teaRanges: { start: number; end: number }[] = [];
+
+  rawBreaks.forEach(curr => {
+    const list = curr.type === 'lunch' ? lunchRanges : teaRanges;
+    const prev = list[list.length - 1];
+    if (!prev || curr.start > prev.end) {
+      list.push({ start: curr.start, end: curr.end });
+    } else {
+      prev.end = Math.max(prev.end, curr.end);
     }
+  });
+
+  lunchRanges.forEach(r => {
+    const durationMs = r.end - r.start;
+    lunchWallMs += durationMs;
+    const capMs = Math.max(0, lunchLimitMinutes) * 60000;
+    allowedBreakMs += Math.min(durationMs, capMs);
+    if (durationMs > capMs) excessBreakMs += durationMs - capMs;
+  });
+
+  teaRanges.forEach(r => {
+    const durationMs = r.end - r.start;
+    teaWallMs += durationMs;
+    const capMs = Math.max(0, teaLimitMinutes) * 60000;
+    allowedBreakMs += Math.min(durationMs, capMs);
+    if (durationMs > capMs) excessBreakMs += durationMs - capMs;
   });
 
   return { lunchWallMs, teaWallMs, allowedBreakMs, excessBreakMs };
@@ -143,44 +156,76 @@ export function closeOpenBreaks(breaks: BreakItem[] | undefined, nowIso: string)
 }
 
 export function computeIdleMs(
-  record: Pick<AttendanceDoc, 'checkInTime' | 'idleIntervals' | 'idleMinutes'>,
+  record: Pick<AttendanceDoc, 'checkInTime' | 'idleIntervals' | 'idleMinutes' | 'sessions'>,
   nowMs: number,
 ): number {
-  const checkInMs = record.checkInTime ? new Date(record.checkInTime).getTime() : 0;
+  // Strict same-day check: Session must start on the same date as the parent record
+  const parentDate = (record as any).date || (record.checkInTime ? record.checkInTime.split('T')[0] : '');
+  const rawSessions = ((record as any).sessions || [])
+    .filter((s: any) => s.checkIn && s.checkIn.startsWith(parentDate))
+    .map((s: any) => ({
+      in: new Date(s.checkIn).getTime(),
+      out: s.checkOut ? new Date(s.checkOut).getTime() : nowMs
+    }))
+    .sort((a, b) => a.in - b.in);
+
+  const mergedSessions: { in: number, out: number }[] = [];
+  rawSessions.forEach(curr => {
+    const prev = mergedSessions[mergedSessions.length - 1];
+    if (!prev || curr.in > prev.out) {
+      mergedSessions.push(curr);
+    } else {
+      prev.out = Math.max(prev.out, curr.out);
+    }
+  });
+
+  const firstSessionTime = mergedSessions.length > 0 ? mergedSessions[0].in : 0;
+  const checkInMs = (record.checkInTime && record.checkInTime.startsWith(parentDate)) 
+    ? new Date(record.checkInTime).getTime() 
+    : firstSessionTime;
+
   const streakMap = new Map<number, number | null>();
 
-  (record.idleIntervals || []).forEach((i) => {
+  (record.idleIntervals || [])
+    .filter(i => i.startTime && i.startTime.startsWith(parentDate)) // Only trust today's idle
+    .forEach((i) => {
     const rawStart = new Date(i.startTime).getTime();
     const start = checkInMs > 0 ? Math.max(rawStart, checkInMs) : rawStart;
     const end = i.endTime ? new Date(i.endTime).getTime() : null;
     const existing = streakMap.get(start);
-    if (existing === undefined) {
+    if (existing === undefined || end === null || (existing !== null && end > existing)) {
       streakMap.set(start, end);
-      return;
     }
-    if (existing === null) return;
-    if (end === null || end > existing) streakMap.set(start, end);
-  });
-
-  let latestOpenStart = -1;
-  streakMap.forEach((end, start) => {
-    if (end === null && start > latestOpenStart) latestOpenStart = start;
   });
 
   let idleMs = 0;
   streakMap.forEach((end, start) => {
-    if (end === null) {
-      if (start === latestOpenStart) idleMs += Math.max(0, nowMs - start);
-      return;
+    const iEnd = end === null ? nowMs : end;
+
+    // Only count idle that falls within an active work session
+    mergedSessions.forEach(s => {
+      const overlapStart = Math.max(start, s.in);
+      const overlapEnd = Math.min(iEnd, s.out);
+      
+      if (overlapEnd > overlapStart) {
+        idleMs += (overlapEnd - overlapStart);
+      }
+    });
+
+    // Fallback for missing sessions array
+    if (mergedSessions.length === 0) {
+      const overlapStart = Math.max(start, checkInMs);
+      const overlapEnd = Math.min(iEnd, nowMs);
+      if (overlapEnd > overlapStart) idleMs += (overlapEnd - overlapStart);
     }
-    if (end > start) idleMs += end - start;
   });
 
-  const hasIntervals = (record.idleIntervals || []).length > 0;
-  if (!hasIntervals) idleMs = Math.max(idleMs, (record.idleMinutes || 0) * 60000);
-  const sessionMs = checkInMs > 0 ? Math.max(0, nowMs - checkInMs) : 0;
-  if (sessionMs > 0) idleMs = Math.min(idleMs, sessionMs);
-  return Math.max(0, idleMs);
+  // Rule: Trust the recomputed interval duration. 
+  // Stored idleMinutes is only used if intervals array is completely missing.
+  if (record.idleIntervals && record.idleIntervals.length > 0) {
+     return Math.max(0, idleMs);
+  }
+  return Math.max(idleMs, (record.idleMinutes || 0) * 60000);
 }
 
 /**
@@ -188,26 +233,66 @@ export function computeIdleMs(
  * Each session is [checkIn, checkOut]. Open session uses nowMs as end.
  * Falls back to (endRefMs - checkInMs) for records without sessions array.
  */
+/**
+ * Compute total worked time across all sessions (handles re-check-in on same day).
+ * Each session is [checkIn, checkOut]. Open session uses nowMs as end.
+ */
 export function computeTotalSessionMs(
   record: Pick<AttendanceDoc, 'checkInTime' | 'checkOutTime' | 'sessions'>,
   endRefMs: number,
 ): number {
-  const sessions = (record as any).sessions as Array<{ checkIn: string; checkOut: string | null }> | undefined;
-  if (sessions && sessions.length > 0) {
-    let total = 0;
+  const sessions = (record as any).sessions as Array<{ checkIn: string; checkOut: string | null }>;
+  if (Array.isArray(sessions) && sessions.length > 0) {
+    const parentDate = (record as any).date || (record.checkInTime ? record.checkInTime.split('T')[0] : '');
+
+    // Convert sessions to ranges and filter by date
+    const ranges: Array<{ start: number; end: number }> = [];
     for (const s of sessions) {
+      if (!s.checkIn) continue;
+      if (parentDate && !s.checkIn.startsWith(parentDate)) continue;
+
       const sIn = new Date(s.checkIn).getTime();
       const sOut = s.checkOut ? new Date(s.checkOut).getTime() : endRefMs;
-      if (Number.isFinite(sIn) && Number.isFinite(sOut) && sOut > sIn) {
-        total += sOut - sIn;
+      
+      if (Number.isFinite(sIn) && Number.isFinite(sOut) && sOut >= sIn) {
+        ranges.push({ start: sIn, end: sOut });
       }
     }
-    return Math.max(0, total);
+
+    if (ranges.length === 0) return 0;
+
+    // Sort by start time
+    ranges.sort((a, b) => a.start - b.start);
+
+    // Merge overlapping ranges to prevent double-counting
+    const merged: Array<{ start: number; end: number }> = [];
+    for (const curr of ranges) {
+      const prev = merged[merged.length - 1];
+      if (!prev || curr.start > prev.end) {
+        merged.push(curr);
+      } else {
+        prev.end = Math.max(prev.end, curr.end);
+      }
+    }
+
+    // Sum the durations of the merged ranges
+    const totalMs = merged.reduce((sum, r) => sum + (r.end - r.start), 0);
+    return Math.max(0, totalMs);
   }
-  // Legacy: no sessions array — use single checkIn→endRef span
-  const checkInMs = record.checkInTime ? new Date(record.checkInTime).getTime() : 0;
-  if (!checkInMs || !Number.isFinite(checkInMs)) return 0;
-  return Math.max(0, endRefMs - checkInMs);
+
+  // Fallback: if sessions array missing, use checkInTime -> endRefMs
+  if (record.checkInTime) {
+    const sIn = new Date(record.checkInTime).getTime();
+    if (Number.isFinite(sIn) && endRefMs >= sIn) {
+      // Check if surprisingly large (over 20 hours is suspicious for a single session fallback)
+      const duration = endRefMs - sIn;
+      if (duration > 20 * 60 * 60 * 1000) return 0; 
+      
+      return duration;
+    }
+  }
+  
+  return 0;
 }
 
 export function computeAttendanceSummary(params: {
@@ -259,7 +344,9 @@ export function computeAttendanceSummary(params: {
       ? derivedIdleMs
       : Math.max(derivedIdleMs, storedIdleMs);
     const recomputedWorkMs = Math.max(0, totalSessionMs - breakTotals.allowedBreakMs - idleMs - breakTotals.excessBreakMs);
-    const workMs = storedWorkMs > 0 ? Math.min(storedWorkMs, totalSessionMs) : recomputedWorkMs;
+    const workMs = (params.record as any).sessions?.length > 0
+      ? recomputedWorkMs
+      : Math.max(recomputedWorkMs, storedWorkMs);
     return {
       shiftMs,
       workMs,
@@ -297,9 +384,17 @@ export function computeAttendanceSummary(params: {
     : breakTotals;
   const idleMs = computeIdleMs(params.record, idleRefMs);
   const computedWorkMs = Math.max(0, frozenSessionMs - frozenBreakTotals.allowedBreakMs - idleMs - frozenBreakTotals.excessBreakMs);
-  const storedWorkMs = Math.max(0, Number(params.record.totalWorkMinutes || 0) * 60000);
-  // Keep running work total monotonic during active session; never jump backward to zero.
-  const workMs = Math.max(computedWorkMs, storedWorkMs);
+  // Hard cap on stored work time to 16 hours to prevent impossible "24-48h" carry-over from corrupted records.
+  const storedWorkMs = Math.min(
+    16 * 60 * 60 * 1000,
+    Math.max(0, Number(params.record.totalWorkMinutes || 0) * 60000)
+  );
+  
+  // Rule: If we have a sessions array, trust the computed value.
+  const workMs = (params.record as any).sessions?.length > 0
+    ? Math.max(computedWorkMs, 0) 
+    : Math.max(computedWorkMs, storedWorkMs);
+
   const targetMs = getTargetWorkMs(cfg, params.record.status, endRefMs);
   return {
     shiftMs,
@@ -325,13 +420,39 @@ export function finalizeAttendanceRecord(params: {
 }): FinalizedAttendance {
   const nowMs = params.nowMs ?? Date.now();
   const nowIso = new Date(nowMs).toISOString();
+  
+  // Close existing open breaks and idle intervals
   const closedBreaks = closeOpenBreaks(params.record.breaks, nowIso);
   const closedIdle = closeOpenIntervals(params.record.idleIntervals, nowIso);
+  
   // Close the open session in sessions array (if present)
   const rawSessions = (params.record as any).sessions as Array<{ checkIn: string; checkOut: string | null }> | undefined;
-  const closedSessions = rawSessions
+  const sessionsToMerge = rawSessions
     ? rawSessions.map((s) => s.checkOut === null ? { ...s, checkOut: nowIso } : s)
-    : undefined;
+    : (params.record.checkInTime ? [{ checkIn: params.record.checkInTime, checkOut: nowIso }] : []);
+
+  // CANONICAL MERGE: Eliminate all overlaps and duplicates before final save.
+  const parentDate = (params.record as any).date || (params.record.checkInTime ? params.record.checkInTime.split('T')[0] : '');
+  const ranges = sessionsToMerge
+    .filter(s => s.checkIn && (!parentDate || s.checkIn.startsWith(parentDate)))
+    .map(s => ({ in: new Date(s.checkIn).getTime(), out: new Date(s.checkOut!).getTime() }))
+    .filter(r => r.out > r.in)
+    .sort((a,b) => a.in - b.in);
+
+  const mergedSessions: Array<{ checkIn: string; checkOut: string }> = [];
+  if (ranges.length > 0) {
+    let current = ranges[0];
+    for (let i = 1; i < ranges.length; i++) {
+      if (ranges[i].in <= current.out) {
+        current.out = Math.max(current.out, ranges[i].out);
+      } else {
+        mergedSessions.push({ checkIn: new Date(current.in).toISOString(), checkOut: new Date(current.out).toISOString() });
+        current = ranges[i];
+      }
+    }
+    mergedSessions.push({ checkIn: new Date(current.in).toISOString(), checkOut: new Date(current.out).toISOString() });
+  }
+
   const summary = computeAttendanceSummary({
     record: {
       ...params.record,
@@ -340,7 +461,7 @@ export function finalizeAttendanceRecord(params: {
       idleIntervals: closedIdle,
       dailyStatus: 'checked-out',
       totalWorkMinutes: 0,
-      ...(closedSessions ? { sessions: closedSessions } : {}),
+      sessions: mergedSessions,
     },
     branchConfig: params.branchConfig,
     nowMs,
@@ -353,6 +474,6 @@ export function finalizeAttendanceRecord(params: {
     totalWorkMinutes: Math.floor(summary.workMs / 60000),
     checkOutTime: nowIso,
     dailyStatus: 'checked-out',
-    ...(closedSessions ? { sessions: closedSessions } : {}),
+    sessions: mergedSessions,
   };
 }

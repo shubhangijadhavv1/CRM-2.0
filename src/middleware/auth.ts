@@ -27,8 +27,12 @@ export function requireAuth(req: AuthedRequest, res: Response, next: NextFunctio
   try {
     const decoded = jwt.verify(token, secret) as any;
     req.user = { id: String(decoded.sub), role: decoded.role };
+
+
+
     return next();
-  } catch {
+  } catch (err) {
+    console.error('[Auth Middleware] Invalid token:', err);
     return res.status(401).json({ error: 'Invalid token' });
   }
 }

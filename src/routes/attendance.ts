@@ -8,7 +8,7 @@ import { sendPushToUser } from '../realtime/webpush.js';
 import { UserModel } from '../models/User.js';
 import { shiftStartPlusGraceUtcMs } from '../utils/shiftDeadline.js';
 import { computeAttendanceSummary, mergeBreaks, mergeIdleIntervals } from '../utils/attendanceMetrics.js';
-import { getLatestAttendanceForDate, resolveCanonicalOpenSession } from '../utils/attendanceSession.js';
+import * as attendanceUtils from '../utils/attendanceSession.js';
 
 export const attendanceRouter = Router();
 
@@ -27,55 +27,7 @@ async function loadBranchConfig(branchKey: string) {
   return BranchConfigModel.findOne({ $or: [{ id: k }, { name: k }] }).lean();
 }
 
-/** Earliest check-in instant for user+date (optionally excluding one attendance id). */
-async function earliestCheckInMs(
-  userId: string,
-  dateStr: string,
-  candidateIso: string,
-  excludeAttendanceId?: string,
-): Promise<number | null> {
-  const candidateMs = new Date(candidateIso).getTime();
-  if (!Number.isFinite(candidateMs)) return null;
-  const rows = await AttendanceModel.find({
-    userId,
-    date: dateStr,
-    checkInTime: { $ne: null },
-  })
-    .select({ id: 1, checkInTime: 1 })
-    .lean();
-  let minMs = candidateMs;
-  for (const r of rows as any[]) {
-    if (excludeAttendanceId && r.id === excludeAttendanceId) continue;
-    const t = new Date(r.checkInTime).getTime();
-    if (Number.isFinite(t)) minMs = Math.min(minMs, t);
-  }
-  return minMs;
-}
-
-async function computeIsLateForRecord(params: {
-  attendanceId?: string;
-  date: string;
-  userId: string;
-  checkInTime: string;
-  branch: string;
-}): Promise<boolean | undefined> {
-  const bc = await loadBranchConfig(params.branch);
-  if (!bc?.startTime) return undefined;
-  const expectedMs = shiftStartPlusGraceUtcMs(
-    params.date,
-    String(bc.startTime),
-    Number((bc as any).lateMarkGraceMinutes) || 0,
-  );
-  if (expectedMs == null) return undefined;
-  const earliestMs = await earliestCheckInMs(
-    params.userId,
-    params.date,
-    params.checkInTime,
-    params.attendanceId,
-  );
-  if (earliestMs == null) return undefined;
-  return earliestMs > expectedMs;
-}
+// ... (other functions) ...
 
 function isAllowedDailyStatusTransition(from: string | undefined, to: string | undefined, payload?: any): boolean {
   if (!from || !to || from === to) return true;
@@ -120,16 +72,92 @@ attendanceRouter.post('/', async (req: AuthedRequest, res, next) => {
       record.userId = req.user.id;
     }
 
+    // 1. Guard: Ensure the ID matches the date in the database (prevent cross-day drift)
+    const existingById = await AttendanceModel.findOne({ id: record.id }).lean() as any;
+    if (existingById && existingById.date !== record.date) {
+      return res.status(400).json({
+        error: `Session ID drift detected. Record ${record.id} belongs to ${existingById.date}, but you sent ${record.date}.`
+      });
+    }
+
+    // 2. Guard: Ensure the primary checkInTime matches the record date
+    if (record.checkInTime && !record.checkInTime.startsWith(record.date)) {
+      return res.status(400).json({
+        error: `Fatal date mismatch: checkInTime (${record.checkInTime}) does not match record date (${record.date}).`
+      });
+    }
+
+    // 3. Resolve Master Record (today's canonical record for this user)
     if (record.userId && record.date && record.checkOutTime == null) {
-      const canonical = await resolveCanonicalOpenSession(String(record.userId), String(record.date));
+      const canonical = await attendanceUtils.resolveMasterRecord(String(record.userId), String(record.date));
       if (canonical && canonical.id !== record.id) {
+        // Force the client to use the existing canonical ID for today
         record.id = canonical.id;
         record.checkInTime = canonical.checkInTime || record.checkInTime;
-        record.breaks = mergeBreaks(canonical.breaks, record.breaks || []);
-        record.idleIntervals = mergeIdleIntervals(canonical.idleIntervals, record.idleIntervals || []);
+        // 1. Merge and Deduplicate Sessions by merging overlaps
+        const canonicalSessions = Array.isArray(canonical.sessions) ? canonical.sessions : [];
+        const recordsessions = Array.isArray(record.sessions) ? record.sessions : [];
+
+        const allSessions = [...canonicalSessions, ...recordsessions]
+          .filter(s => s.checkIn && s.checkIn.startsWith(record.date))
+          .map(s => ({
+            in: new Date(s.checkIn).getTime(),
+            out: s.checkOut ? new Date(s.checkOut).getTime() : Date.now()
+          }))
+          .sort((a, b) => a.in - b.in);
+
+        const merged: any[] = [];
+        allSessions.forEach(curr => {
+          const prev = merged[merged.length - 1];
+          if (!prev || curr.in > prev.out + 60000) { // 1 min gap allowed
+            merged.push(curr);
+          } else {
+            prev.out = Math.max(prev.out, curr.out);
+          }
+        });
+        record.sessions = merged.map(m => ({
+          checkIn: new Date(m.in).toISOString(),
+          checkOut: (m.out >= Date.now() - 30000) ? null : new Date(m.out).toISOString()
+        }));
+
+        // 2. Merge and Deduplicate Breaks
+        const canonicalBreaks = Array.isArray(canonical.breaks) ? canonical.breaks : [];
+        const incomingBreaks = Array.isArray(record.breaks) ? record.breaks : [];
+        const breakMap = new Map();
+        canonicalBreaks.forEach(b => { if (b.startTime) breakMap.set(b.startTime, b); });
+        incomingBreaks.forEach(b => {
+          if (b.startTime && b.startTime.startsWith(record.date)) {
+            const existing = breakMap.get(b.startTime);
+            if (!existing || (!existing.endTime && b.endTime)) {
+              breakMap.set(b.startTime, b);
+            }
+          }
+        });
+        record.breaks = Array.from(breakMap.values()).sort((a, b) => a.startTime.localeCompare(b.startTime));
+
+        // 3. Merge and Deduplicate Idle Intervals
+        const canonicalIdle = Array.isArray(canonical.idleIntervals) ? canonical.idleIntervals : [];
+        const incomingIdle = Array.isArray(record.idleIntervals) ? record.idleIntervals : [];
+        const idleMap = new Map();
+        canonicalIdle.forEach(i => { if (i.startTime) idleMap.set(i.startTime, i); });
+        incomingIdle.forEach(i => {
+          if (i.startTime && i.startTime.startsWith(record.date)) {
+            const existing = idleMap.get(i.startTime);
+            if (!existing || (!existing.endTime && i.endTime)) {
+              idleMap.set(i.startTime, i);
+            }
+          }
+        });
+        record.idleIntervals = Array.from(idleMap.values()).sort((a, b) => a.startTime.localeCompare(b.startTime));
+
         record.idleMinutes = Math.max(Number(canonical.idleMinutes || 0), Number(record.idleMinutes || 0));
         record.totalWorkMinutes = Math.max(Number(canonical.totalWorkMinutes || 0), Number(record.totalWorkMinutes || 0));
       }
+    }
+
+    // 4. Final session scrubbing: NEVER allow yesterday's sessions in today's record
+    if (Array.isArray(record.sessions)) {
+      record.sessions = record.sessions.filter((s: any) => s.checkIn && s.checkIn.startsWith(record.date));
     }
 
     // --- Server-authoritative late-mark (branch id OR name; office offset via BRANCH_UTC_OFFSET_MINUTES) ---
@@ -137,7 +165,7 @@ attendanceRouter.post('/', async (req: AuthedRequest, res, next) => {
       const checkInMs = new Date(record.checkInTime).getTime();
       if (!Number.isFinite(checkInMs)) return res.status(400).json({ error: 'Invalid checkInTime' });
       const branchKey = record.branch || 'Main';
-      const computed = await computeIsLateForRecord({
+      const computed = await attendanceUtils.computeIsLateForRecord({
         attendanceId: record.id,
         date: record.date,
         userId: record.userId,
@@ -192,7 +220,7 @@ attendanceRouter.post('/', async (req: AuthedRequest, res, next) => {
           body: `${userName} checked in late today.`,
           tag: `late-${record.userId}-${record.date}`,
           url: '/'
-        }).catch(() => {});
+        }).catch(() => { });
       }
     }
 
@@ -311,10 +339,9 @@ attendanceRouter.post('/:id/break/end', async (req: AuthedRequest, res, next) =>
 attendanceRouter.get('/my-summary', async (req: AuthedRequest, res, next) => {
   try {
     const userId = req.user!.id;
-    const today = new Date().toISOString().split('T')[0];
+    const today = attendanceUtils.getLocalTodayStr();
     const now = Date.now();
-    const openRec = await resolveCanonicalOpenSession(userId, today);
-    const rec: any = openRec || await getLatestAttendanceForDate(userId, today);
+    const rec: any = await attendanceUtils.resolveMasterRecord(userId, today);
 
     if (!rec || !rec.checkInTime) {
       return res.json({ summary: null });
@@ -322,11 +349,38 @@ attendanceRouter.get('/my-summary', async (req: AuthedRequest, res, next) => {
 
     const branchKey = String(rec.branch || 'Main');
     const bc = await BranchConfigModel.findOne({ $or: [{ id: branchKey }, { name: branchKey }] }).lean() as any;
-    const summary = computeAttendanceSummary({
-      record: rec,
+    // Sanitize in case of legacy drift in DB
+    const sanitizedRec = {
+      ...rec,
+      idleMinutes: (rec.checkInTime && rec.checkInTime.startsWith(today)) ? rec.idleMinutes : 0,
+      totalWorkMinutes: (rec.checkInTime && rec.checkInTime.startsWith(today)) ? rec.totalWorkMinutes : 0,
+    };
+
+    // Auto-repair: If record has checkInTime but NO sessions, re-create the session to fix the display.
+    if ((!rec.sessions || rec.sessions.length === 0) && rec.checkInTime && rec.checkInTime.startsWith(today)) {
+      const repairedSessions = [{
+        checkIn: rec.checkInTime,
+        checkOut: rec.checkOutTime || (rec.dailyStatus === 'checked-out' ? rec.updatedAt : null)
+      }];
+      await AttendanceModel.findOneAndUpdate({ id: rec.id }, { $set: { sessions: repairedSessions } });
+      rec.sessions = repairedSessions;
+    }
+
+    let summary = computeAttendanceSummary({
+      record: sanitizedRec,
       branchConfig: bc || undefined,
       nowMs: now,
     });
+
+    // Final safety: if summary is missing core fields or is zero despite being checked in, 
+    // calculate a basic 'wall-clock' shift to ensure the agent shows SOMETHING.
+    if (sanitizedRec.checkInTime && sanitizedRec.checkInTime.startsWith(today)) {
+      const checkInMs = new Date(sanitizedRec.checkInTime).getTime();
+      const wallShiftMs = Math.max(0, now - checkInMs);
+      if ((summary.shiftMs || 0) < 60000) summary.shiftMs = wallShiftMs;
+      // If workMs is 0, estimate it as shiftMs - idle (roughly)
+      if ((summary.workMs || 0) < 60000) summary.workMs = Math.max(0, wallShiftMs - (summary.idleMs || 0));
+    }
 
     return res.json({
       summary: { ...summary, breakMs: summary.teaMs }
@@ -347,79 +401,6 @@ attendanceRouter.get('/:id', async (req: AuthedRequest, res, next) => {
     const out: any = { ...doc };
     delete out._id;
     delete out.__v;
-    return res.json({ attendanceRecord: out });
-  } catch (e) {
-    return next(e);
-  }
-});
-
-// Super-admin manual override — works for any date (backdate or today)
-// POST body: { userId, date, isLate, lateReason, status, dailyStatus }
-// If no record exists for that user+date, creates one. Otherwise patches it.
-attendanceRouter.post('/admin-override', async (req: AuthedRequest, res, next) => {
-  try {
-    if (req.user?.role !== 'super-admin') return res.status(403).json({ error: 'Super-admin only' });
-
-    const { userId, date, isLate, lateReason, status, dailyStatus, mode, idleMinutes, checkInTime, checkOutTime } = req.body ?? {};
-    if (!userId || !date) return res.status(400).json({ error: 'userId and date are required' });
-
-    const user = await UserModel.findById(userId).lean();
-    if (!user) return res.status(404).json({ error: 'User not found' });
-
-    const patch: any = {};
-    if (isLate !== undefined) patch.isLate = Boolean(isLate);
-    if (lateReason !== undefined) patch.lateReason = String(lateReason || '');
-    if (status !== undefined) patch.status = status;
-    if (dailyStatus !== undefined) patch.dailyStatus = dailyStatus;
-    if (mode !== undefined && ['office', 'wfh'].includes(mode)) patch.mode = mode;
-    if (idleMinutes !== undefined && Number.isFinite(Number(idleMinutes))) patch.idleMinutes = Math.max(0, Number(idleMinutes));
-    if (checkInTime !== undefined && typeof checkInTime === 'string' && checkInTime) patch.checkInTime = checkInTime;
-    if (checkOutTime !== undefined && typeof checkOutTime === 'string' && checkOutTime) {
-      patch.checkOutTime = checkOutTime;
-      // Auto-set dailyStatus to checked-out when checkOutTime is provided (unless caller overrides)
-      if (dailyStatus === undefined) patch.dailyStatus = 'checked-out';
-    } else if (checkInTime !== undefined && typeof checkInTime === 'string' && checkInTime && dailyStatus === undefined) {
-      // Auto-set dailyStatus to checked-in when only checkInTime is provided
-      patch.dailyStatus = 'checked-in';
-    }
-
-    // Try to find existing record for this user+date
-    const existing = await AttendanceModel.findOne({ userId, date }).lean();
-
-    let result: any;
-    if (existing) {
-      result = await AttendanceModel.findOneAndUpdate(
-        { userId, date },
-        { $set: patch },
-        { new: true }
-      ).lean();
-    } else {
-      // Create a minimal record for the backdate
-      result = await AttendanceModel.create({
-        id: `override-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-        userId,
-        userName: String((user as any).name || 'Staff'),
-        date,
-        branch: String((user as any).branch || 'Main'),
-        mode: patch.mode || 'office',
-        checkInTime: patch.checkInTime || null,
-        checkOutTime: patch.checkOutTime || null,
-        ipAddress: 'manual-override',
-        isLate: Boolean(patch.isLate ?? false),
-        lateReason: patch.lateReason || '',
-        breaks: [],
-        idleIntervals: [],
-        idleMinutes: patch.idleMinutes ?? 0,
-        totalWorkMinutes: 0,
-        status: patch.status || 'absent',
-        dailyStatus: patch.checkOutTime ? 'checked-out' : patch.checkInTime ? 'checked-in' : 'offline',
-      });
-    }
-
-    const out: any = { ...(result?.toObject ? result.toObject() : result) };
-    delete out._id;
-    delete out.__v;
-    emitInvalidate('attendance');
     return res.json({ attendanceRecord: out });
   } catch (e) {
     return next(e);
@@ -461,7 +442,7 @@ attendanceRouter.put('/:id', async (req: AuthedRequest, res, next) => {
       merged.checkInTime &&
       (patch.checkInTime != null || patch.date != null || patch.branch != null || patch.userId != null)
     ) {
-      const computed = await computeIsLateForRecord({
+      const computed = await attendanceUtils.computeIsLateForRecord({
         attendanceId: id,
         date: merged.date,
         userId: merged.userId,

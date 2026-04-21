@@ -16,8 +16,7 @@ import { emitInvalidate } from '../realtime/invalidate.js';
 import { emitNotify } from '../realtime/notify.js';
 import { emitUserStatus } from '../realtime/io.js';
 import { computeAttendanceSummary, finalizeAttendanceRecord } from '../utils/attendanceMetrics.js';
-import { resolveCanonicalOpenSession } from '../utils/attendanceSession.js';
-import { shiftStartPlusGraceUtcMs } from '../utils/shiftDeadline.js';
+import * as attendanceUtils from '../utils/attendanceSession.js';
 
 export const activityRouter = Router();
 
@@ -31,7 +30,7 @@ async function pruneActivityLogs(userId: string, retentionDays?: number): Promis
   await ActivityLogModel.deleteMany({
     userId,
     at: { $lt: new Date(Date.now() - days * 24 * 60 * 60 * 1000) }
-  }).catch(() => {});
+  }).catch(() => { });
 }
 const idleAlertState = new Map<string, { openSince: string; lastAlertAt: number; sentCount: number }>();
 const IDLE_ALERT_AFTER_MS = 30 * 1000;
@@ -41,12 +40,9 @@ const MAX_IDLE_ALERTS_PER_STREAK = 2;
 const keywordAlertCooldown = new Map<string, number>(); // key: `${userId}:${keyword}` → lastAlertAt ms
 const KEYWORD_ALERT_COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes between same-keyword alerts per user
 
-// Max base64 size accepted (~1 MB decoded) to support 1280×720 JPEG quality 85
-const SCREENSHOT_MAX_B64_CHARS = 1_500_000; // ~1.1 MB decoded JPEG
+// Max base64 size accepted (~300 KB decoded) to protect MongoDB from oversized screenshots
+const SCREENSHOT_MAX_B64_CHARS = 450_000; // ~337 KB decoded PNG/JPEG
 
-function todayStr() {
-  return new Date().toISOString().split('T')[0];
-}
 
 async function createAdminAlert(
   ruleKey: string,
@@ -57,7 +53,7 @@ async function createAdminAlert(
   recipientRoles: Array<'admin' | 'super-admin'> = ['admin', 'super-admin'],
 ) {
   const id = `agent-alert-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  await AgentAlertModel.create({ id, userId, ruleKey, message, details, severity }).catch(() => {});
+  await AgentAlertModel.create({ id, userId, ruleKey, message, details, severity }).catch(() => { });
   const admins = await UserModel.find({ role: { $in: recipientRoles }, status: 'active' }).select('_id').lean();
   const now = new Date().toLocaleTimeString();
   if (admins.length > 0) {
@@ -71,7 +67,7 @@ async function createAdminAlert(
       read: false,
       link: { view: 'live-workplace', userId }
     }));
-    await NotificationModel.insertMany(rows).catch(() => {});
+    await NotificationModel.insertMany(rows).catch(() => { });
     for (const u of admins) {
       emitNotify(String((u as any)._id), {
         id: `realtime-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -136,14 +132,22 @@ activityRouter.post('/heartbeat', async (req: AuthedRequest, res, next) => {
 
     const updated = await UserModel.findByIdAndUpdate(req.user!.id, { $set: patch }, { new: true }).lean();
 
-    // Append to activity log (staff-wise, type = active/idle) for desktop agent logs
-    await ActivityLogModel.create({
-      userId: req.user!.id,
-      at: new Date(),
-      status: serverIsIdle ? 'idle' : 'active',
-      source: crmOrigin || 'browser'
-    }).catch(() => {});
-    const attForAlert = await resolveCanonicalOpenSession(req.user!.id, todayStr());
+    // --- Session-Aware Activity Logging ---
+    // Only log activity (Went Idle / Resumed Active) if there is an active attendance session for today.
+    // This prevents "ghost" idle logs appearing after a user has clocked out.
+    const todayStr = attendanceUtils.getLocalTodayStr();
+    const currentAtt = await attendanceUtils.resolveMasterRecord(req.user!.id, todayStr);
+    const isClockedIn = !!currentAtt && currentAtt.dailyStatus !== "checked-out";
+
+    if (isClockedIn) {
+      await ActivityLogModel.create({
+        userId: req.user!.id,
+        at: new Date(),
+        status: serverIsIdle ? 'idle' : 'active',
+        source: crmOrigin || 'browser'
+      }).catch(() => { });
+    }
+    const attForAlert = await attendanceUtils.resolveCanonicalOpenSession(req.user!.id, attendanceUtils.getLocalTodayStr());
     const userRole = String((updated as any)?.role || '');
     const isAdminRole = userRole === 'super-admin' || userRole === 'admin';
     const isBreakMode = String((attForAlert as any)?.dailyStatus || '').includes('break');
@@ -189,14 +193,14 @@ activityRouter.post('/heartbeat', async (req: AuthedRequest, res, next) => {
     if (!updated) return res.status(404).json({ error: 'User not found' });
 
     // --- Update today's attendance live status based on browser-wide activity ---
-    // This makes "Idle" visible to admins even when CRM tab isn't open.
-    // Only applies to active sessions (checkOutTime is null) and does not override breaks.
-    const today = new Date().toISOString().split('T')[0];
-    let att = await resolveCanonicalOpenSession(req.user!.id, today);
+    const today = attendanceUtils.getLocalTodayStr();
+    let att = currentAtt;
     const lastAgentLoginMs = (updated as any)?.lastAgentLoginAt ? new Date((updated as any).lastAgentLoginAt).getTime() : 0;
     const lastAgentLogoutMs = (updated as any)?.lastAgentLogoutAt ? new Date((updated as any).lastAgentLogoutAt).getTime() : 0;
     const agentSessionActive = lastAgentLoginMs > 0 && lastAgentLoginMs >= lastAgentLogoutMs;
+
     if (!att && crmOrigin === 'desktop-agent' && agentSessionActive) {
+      const nowIso = new Date().toISOString();
       const user = await UserModel.findById(req.user!.id).select('name branch').lean();
       const created = await AttendanceModel.create({
         id: `agent-hb-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
@@ -205,11 +209,17 @@ activityRouter.post('/heartbeat', async (req: AuthedRequest, res, next) => {
         date: today,
         branch: String((user as any)?.branch || 'Main'),
         mode: 'office',
-        checkInTime: new Date().toISOString(),
+        checkInTime: nowIso,
         checkOutTime: null,
         ipAddress: '',
-        isLate: false,
+        isLate: await attendanceUtils.computeIsLateForRecord({
+          date: today,
+          userId: req.user!.id,
+          checkInTime: nowIso,
+          branch: String((user as any)?.branch || 'Main'),
+        }) || false,
         breaks: [],
+        sessions: [{ checkIn: nowIso, checkOut: null }],
         idleIntervals: [],
         idleMinutes: 0,
         totalWorkMinutes: 0,
@@ -218,6 +228,7 @@ activityRouter.post('/heartbeat', async (req: AuthedRequest, res, next) => {
       });
       att = (created as any).toObject ? (created as any).toObject() : (created as any);
     }
+
 
     // Only desktop agent heartbeats update idle intervals — browser heartbeats carry no idle signal.
     if (isDesktopAgent && att && att.dailyStatus !== 'checked-out' && att.dailyStatus !== 'lunch-break' && att.dailyStatus !== 'tea-break') {
@@ -237,9 +248,19 @@ activityRouter.post('/heartbeat', async (req: AuthedRequest, res, next) => {
       const activeIso = new Date(Math.max(lastActivityAt, checkInMs > 0 ? checkInMs : lastActivityAt)).toISOString();
 
       if (serverIsIdle) {
-        // Only open a new interval if none is open already
+        // Gap/Drift Protection: 
+        // 1. If we just resumed after a long silence, don't back-fill idle time.
+        // 2. If the idle start is from a previous day, force it to NOW.
+        const lastHeartbeatAt = (updated as any)?.lastBrowserHeartbeatAt ? new Date((updated as any).lastBrowserHeartbeatAt).getTime() : 0;
+        const silenceMs = Date.now() - lastHeartbeatAt;
+        const maxBackfillMs = 10 * 60 * 1000; // 10 minutes max back-fill
+
+        const isPastDay = !attendanceUtils.isSameDay(clampedIdleStartMs, nowTs);
+
         if (openIdx === -1) {
-          idleIntervals.push({ startTime: idleStartIso, endTime: null, deducted: false });
+          const forceNow = (silenceMs > maxBackfillMs) || isPastDay;
+          const effectiveIdleStart = forceNow ? new Date().toISOString() : idleStartIso;
+          idleIntervals.push({ startTime: effectiveIdleStart, endTime: null, deducted: false });
         }
         const updatedAtt = await AttendanceModel.findOneAndUpdate(
           { id: att.id },
@@ -325,6 +346,12 @@ activityRouter.post('/heartbeat', async (req: AuthedRequest, res, next) => {
     });
     emitInvalidate('users');
     emitInvalidate('attendance');
+
+    // After all updates, check if this session should be auto-clocked out (target hit)
+    if (att && att.dailyStatus !== 'checked-out') {
+      await attendanceUtils.maybeAutoCheckout(att, Date.now());
+    }
+
     return res.json({ ok: true });
   } catch (e) {
     return next(e);
@@ -336,6 +363,7 @@ activityRouter.post('/heartbeat', async (req: AuthedRequest, res, next) => {
 activityRouter.post('/agent-login', async (req: AuthedRequest, res, next) => {
   try {
     const now = new Date();
+    const isoNow = now.toISOString();
     const user = await UserModel.findById(req.user!.id).lean();
     if (!user) return res.status(404).json({ error: 'User not found' });
     if (user.status !== 'active') return res.status(403).json({ error: 'Account is inactive.' });
@@ -354,32 +382,13 @@ activityRouter.post('/agent-login', async (req: AuthedRequest, res, next) => {
       }
     });
 
-    const date = todayStr();
-    const openRecord = await resolveCanonicalOpenSession(req.user!.id, date);
-    if (!openRecord) {
+    const date = attendanceUtils.getLocalTodayStr();
+    // master ensures we reuse the same record for the whole day across all platforms
+    const master = await attendanceUtils.resolveMasterRecord(req.user!.id, date);
+
+    if (!master) {
+      // First check-in of the day
       const branch = String((user as any).branch || 'Main');
-      const checkInTime = now.toISOString();
-
-      // Compute late mark the same way the web check-in does
-      let isLate = false;
-      try {
-        const bc = await BranchConfigModel.findOne({
-          $or: [{ id: branch }, { name: branch }]
-        }).lean();
-        if (bc?.startTime) {
-          const expectedMs = shiftStartPlusGraceUtcMs(
-            date,
-            String(bc.startTime),
-            Number((bc as any).lateMarkGraceMinutes) || 0,
-          );
-          if (expectedMs != null) {
-            isLate = now.getTime() > expectedMs;
-          }
-        }
-      } catch {
-        // fall back to false if branch config unavailable
-      }
-
       await AttendanceModel.create({
         id: `agent-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
         userId: req.user!.id,
@@ -387,21 +396,53 @@ activityRouter.post('/agent-login', async (req: AuthedRequest, res, next) => {
         date,
         branch,
         mode: 'office',
-        checkInTime,
+        checkInTime: isoNow,
         checkOutTime: null,
         ipAddress: '',
-        isLate,
+        isLate: await attendanceUtils.computeIsLateForRecord({
+          date,
+          userId: req.user!.id,
+          checkInTime: isoNow,
+          branch,
+        }) || false,
         breaks: [],
+        sessions: [{ checkIn: isoNow, checkOut: null }],
         idleIntervals: [],
         idleMinutes: 0,
         totalWorkMinutes: 0,
         status: 'present',
         dailyStatus: 'checked-in'
       });
-    } else if (!openRecord.checkInTime || openRecord.dailyStatus === 'checked-out') {
+    } else {
+      // Already has a record today. Ensure it's strictly for today.
+      const sessions = (Array.isArray(master.sessions) ? [...master.sessions] : [])
+        .filter(s => s.checkIn && s.checkIn.startsWith(date));
+      const lastSession = sessions[sessions.length - 1];
+
+      const patch: any = {
+        dailyStatus: 'checked-in',
+        checkInTime: master.checkInTime && master.checkInTime.startsWith(date) ? master.checkInTime : isoNow,
+        checkOutTime: null
+      };
+
+      if (!lastSession || lastSession.checkOut !== null) {
+        sessions.push({ checkIn: isoNow, checkOut: null });
+        patch.sessions = sessions;
+      }
+
+      // If re-checking in, also re-calculate isLate based on earliestCheckInMs
+      const isLate = await attendanceUtils.computeIsLateForRecord({
+        attendanceId: master.id,
+        date,
+        userId: req.user!.id,
+        checkInTime: isoNow,
+        branch: String((master as any).branch || 'Main'),
+      });
+      if (isLate !== undefined) patch.isLate = isLate;
+
       await AttendanceModel.findOneAndUpdate(
-        { id: openRecord.id },
-        { $set: { dailyStatus: 'checked-in', checkOutTime: null, checkInTime: openRecord.checkInTime || now.toISOString() } },
+        { id: master.id },
+        { $set: patch },
         { new: false }
       );
     }
@@ -412,14 +453,27 @@ activityRouter.post('/agent-login', async (req: AuthedRequest, res, next) => {
       status: 'active',
       source: 'desktop-agent',
       eventType: 'agent-login'
-    }).catch(() => {});
+    }).catch(() => { });
 
     void pruneActivityLogs(req.user!.id, (await getAgentPolicy()).retentionDays);
+
+    const summaryRec = await attendanceUtils.resolveMasterRecord(req.user!.id, date);
+    const branchKey = String(summaryRec?.branch || 'Main');
+    const bc = await BranchConfigModel.findOne({ $or: [{ id: branchKey }, { name: branchKey }] }).lean() as any;
+    const summary = computeAttendanceSummary({
+      record: summaryRec as any,
+      branchConfig: bc || undefined,
+      nowMs: now.getTime(),
+    });
 
     emitInvalidate('users');
     emitInvalidate('attendance');
     emitInvalidate('activity');
-    return res.json({ ok: true, connectedForMs: AGENT_HEALTH_MS });
+    return res.json({ 
+      ok: true, 
+      connectedForMs: AGENT_HEALTH_MS,
+      summary: { ...summary, breakMs: summary.teaMs }
+    });
   } catch (e) {
     return next(e);
   }
@@ -458,30 +512,35 @@ activityRouter.post('/agent-logout', async (req: AuthedRequest, res, next) => {
         browserCrmOrigin: ''
       }
     });
-    const date = todayStr();
-    const openRecord = await resolveCanonicalOpenSession(userId, date);
-    if (openRecord?.id) {
-      const branchId = String(openRecord.branch || '');
+
+    const date = attendanceUtils.getLocalTodayStr();
+    const master = await attendanceUtils.resolveMasterRecord(userId, date);
+
+    if (master && master.checkOutTime === null) {
+      const branchId = String(master.branch || '');
       const branchConfig = branchId ? await BranchConfigModel.findOne({ $or: [{ id: branchId }, { name: branchId }] }).lean() : null;
+
       const finalized = finalizeAttendanceRecord({
-        record: openRecord as any,
+        record: master as any,
         branchConfig: branchConfig || undefined,
         nowMs,
       });
 
       await AttendanceModel.findOneAndUpdate(
-        { id: openRecord.id },
+        { id: master.id },
         { $set: finalized },
         { new: false }
       );
     }
+
     await ActivityLogModel.create({
       userId,
       at: now,
       status: 'idle',
       source: 'desktop-agent',
       eventType: 'agent-logout'
-    }).catch(() => {});
+    }).catch(() => { });
+
     emitInvalidate('users');
     emitInvalidate('attendance');
     emitInvalidate('activity');
@@ -490,6 +549,7 @@ activityRouter.post('/agent-logout', async (req: AuthedRequest, res, next) => {
     return next(e);
   }
 });
+
 
 // POST /api/activity/events — desktop agent sends keyboard/mouse activity (batch)
 activityRouter.post('/events', async (req: AuthedRequest, res, next) => {
@@ -514,7 +574,7 @@ activityRouter.post('/events', async (req: AuthedRequest, res, next) => {
       });
     }
     if (toCreate.length > 0) {
-      await ActivityLogModel.insertMany(toCreate).catch(() => {});
+      await ActivityLogModel.insertMany(toCreate).catch(() => { });
       // Prune old logs (non-blocking) using policy retention
       const policy = await getAgentPolicy();
       void pruneActivityLogs(req.user!.id, policy.retentionDays);
@@ -552,7 +612,7 @@ activityRouter.post('/window-events', async (req: AuthedRequest, res, next) => {
       });
     }
     if (toCreate.length > 0) {
-      await AgentWindowEventModel.insertMany(toCreate).catch(() => {});
+      await AgentWindowEventModel.insertMany(toCreate).catch(() => { });
       const blocked = Array.isArray(policy.blockedKeywords) ? policy.blockedKeywords : [];
       if (blocked.length > 0) {
         for (const row of toCreate) {
@@ -581,7 +641,7 @@ activityRouter.post('/window-events', async (req: AuthedRequest, res, next) => {
       await AgentWindowEventModel.deleteMany({
         userId: req.user!.id,
         at: { $lt: new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000) }
-      }).catch(() => {});
+      }).catch(() => { });
       emitInvalidate('activity');
     }
     return res.json({ ok: true, received: toCreate.length });
@@ -594,12 +654,7 @@ activityRouter.post('/window-events', async (req: AuthedRequest, res, next) => {
 activityRouter.post('/screenshots', async (req: AuthedRequest, res, next) => {
   try {
     const policy = await getAgentPolicy();
-    // Per-user override takes priority over global policy
-    const userDoc = await UserModel.findById(req.user!.id).select('screenshotEnabled').lean() as any;
-    const userOverride = userDoc?.screenshotEnabled;  // boolean or undefined
-    const screenshotAllowed = typeof userOverride === 'boolean' ? userOverride : policy.screenshotEnabled;
-    console.log(`[screenshot-post] userId=${req.user!.id} userOverride=${userOverride} globalPolicy=${policy.screenshotEnabled} allowed=${screenshotAllowed}`);
-    if (!screenshotAllowed) return res.json({ ok: true, stored: false, skipped: 'screenshotDisabled' });
+    if (!policy.screenshotEnabled) return res.json({ ok: true, stored: false, skipped: 'screenshotDisabled' });
 
     const imageDataUrl = typeof req.body?.imageDataUrl === 'string' ? req.body.imageDataUrl : '';
     if (!imageDataUrl.startsWith('data:image/')) {
@@ -609,7 +664,7 @@ activityRouter.post('/screenshots', async (req: AuthedRequest, res, next) => {
     // Reject screenshots that are too large to protect MongoDB storage
     if (imageDataUrl.length > SCREENSHOT_MAX_B64_CHARS) {
       return res.status(413).json({
-        error: 'Screenshot too large. Max ~1 MB per image.',
+        error: 'Screenshot too large. Reduce capture resolution or quality on the agent.',
         maxChars: SCREENSHOT_MAX_B64_CHARS,
         receivedChars: imageDataUrl.length
       });
@@ -637,7 +692,7 @@ activityRouter.post('/screenshots', async (req: AuthedRequest, res, next) => {
     await AgentScreenshotModel.deleteMany({
       userId: req.user!.id,
       at: { $lt: new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000) }
-    }).catch(() => {});
+    }).catch(() => { });
 
     // Hard cap: keep at most 200 screenshots per user (delete oldest beyond cap)
     const totalCount = await AgentScreenshotModel.countDocuments({ userId: req.user!.id });
@@ -648,7 +703,7 @@ activityRouter.post('/screenshots', async (req: AuthedRequest, res, next) => {
         .select('_id')
         .lean();
       if (oldest.length > 0) {
-        await AgentScreenshotModel.deleteMany({ _id: { $in: oldest.map((d: any) => d._id) } }).catch(() => {});
+        await AgentScreenshotModel.deleteMany({ _id: { $in: oldest.map((d: any) => d._id) } }).catch(() => { });
       }
     }
 
@@ -677,7 +732,7 @@ activityRouter.get('/window-events', requireRole(['admin', 'super-admin']), asyn
       action: 'view_window_events',
       targetUserId: userId || '',
       metadata: JSON.stringify({ limit }).slice(0, 4000)
-    }).catch(() => {});
+    }).catch(() => { });
     return res.json({ events });
   } catch (e) {
     return next(e);
@@ -689,7 +744,7 @@ activityRouter.get('/window-events', requireRole(['admin', 'super-admin']), asyn
 activityRouter.get('/screenshots', requireRole(['admin', 'super-admin']), async (req: AuthedRequest, res, next) => {
   try {
     const userId = typeof req.query.userId === 'string' ? req.query.userId : undefined;
-    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
+    const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 20));
     const withImage = req.query.withImage === '1';
     const q: any = {};
     if (userId) q.userId = userId;
@@ -704,7 +759,7 @@ activityRouter.get('/screenshots', requireRole(['admin', 'super-admin']), async 
       action: 'view_screenshots',
       targetUserId: userId || '',
       metadata: JSON.stringify({ limit, withImage }).slice(0, 4000)
-    }).catch(() => {});
+    }).catch(() => { });
 
     return res.json({
       screenshots: shots.map((s: any) => ({
@@ -729,9 +784,9 @@ activityRouter.get('/screenshots/:id/image', requireRole(['admin', 'super-admin'
     const shot = await AgentScreenshotModel.findById(req.params.id).select('imageDataUrl mimeType userId').lean() as any;
     if (!shot) return res.status(404).json({ error: 'Screenshot not found' });
     // Return as proper image response to save bandwidth (no JSON wrapper)
-    const base64 = String(shot.imageDataUrl || '').trim();
-    const match = base64.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/s);
-    if (!match) return res.status(422).json({ error: 'Invalid image data stored for this screenshot' });
+    const base64 = String(shot.imageDataUrl || '');
+    const match = base64.match(/^data:(image\/[a-z+]+);base64,(.+)$/);
+    if (!match) return res.status(422).json({ error: 'Invalid image data' });
     const buf = Buffer.from(match[2], 'base64');
     res.set('Content-Type', match[1]);
     res.set('Content-Length', String(buf.length));
@@ -755,7 +810,7 @@ activityRouter.delete('/screenshots', requireRole(['admin', 'super-admin']), asy
       action: 'delete_screenshots',
       targetUserId: userId || '',
       metadata: JSON.stringify({ deletedCount: result.deletedCount || 0 }).slice(0, 4000)
-    }).catch(() => {});
+    }).catch(() => { });
     emitInvalidate('activity');
     return res.json({ ok: true, deletedCount: result.deletedCount || 0 });
   } catch (e) {
@@ -803,7 +858,7 @@ activityRouter.put('/alerts/:id/resolve', requireRole(['admin', 'super-admin']),
       actorUserId: req.user!.id,
       action: 'resolve_agent_alert',
       targetUserId: String((alert as any).userId || '')
-    }).catch(() => {});
+    }).catch(() => { });
     emitInvalidate('activity');
     return res.json({ ok: true });
   } catch (e) {
@@ -930,7 +985,7 @@ activityRouter.post('/cleanup', requireRole(['admin', 'super-admin']), async (re
       actorUserId: req.user!.id,
       action: 'db_cleanup',
       metadata: JSON.stringify({ targets, olderThanDays, result }).slice(0, 4000)
-    }).catch(() => {});
+    }).catch(() => { });
 
     return res.json({ deleted: result, total });
   } catch (e) {
