@@ -25,7 +25,8 @@ export function initIo(httpServer: HttpServer, clientOrigins: string | string[])
       const decoded = jwt.verify(token, secret) as any;
       (socket.data as any).user = { id: String(decoded.sub), role: decoded.role } satisfies AuthUser;
       return next();
-    } catch {
+    } catch (err: any) {
+      console.warn('[socket] unauthorized connection attempt:', err.message);
       return next(new Error('unauthorized'));
     }
   });

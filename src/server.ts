@@ -8,6 +8,13 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:http';
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[fatal] Unhandled Rejection at:', promise, 'reason:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[fatal] Uncaught Exception:', err);
+});
 import { connectMongo } from './config/db.js';
 import { authRouter } from './routes/auth.js';
 import { tasksRouter } from './routes/tasks.js';
