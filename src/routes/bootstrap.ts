@@ -125,7 +125,7 @@ async function getCoreData(userId: string) {
     };
 
   const attendanceRecords = attendanceTodayRaw.map((r: any) => {
-    const out: any = { ...r, id: String(r._id) };
+    const out: any = { ...r, id: r.id || String(r._id) };
     delete out._id;
     delete out.__v;
     return out;
@@ -156,28 +156,28 @@ async function getHistoryData(userId: string, role: string) {
   ]);
 
   const attendanceRecords = attendanceRaw.map((r: any) => {
-    const out: any = { ...r, id: String(r._id) };
+    const out: any = { ...r, id: r.id || String(r._id) };
     delete out._id;
     delete out.__v;
     return out;
   });
 
   const leaves = leavesRaw.map((l: any) => {
-    const out: any = { ...l, id: String(l._id) };
+    const out: any = { ...l, id: l.id || String(l._id) };
     delete out._id;
     delete out.__v;
     return out;
   });
 
   const behaviorRecords = behaviorRaw.map((b: any) => {
-    const out: any = { ...b, id: String(b._id) };
+    const out: any = { ...b, id: b.id || String(b._id) };
     delete out._id;
     delete out.__v;
     return out;
   });
 
   const notices = noticesRaw.map((n: any) => {
-    const out: any = { ...n, id: String(n._id) };
+    const out: any = { ...n, id: n.id || String(n._id) };
     delete out._id;
     delete out.__v;
     return out;
@@ -198,12 +198,12 @@ async function getHistoryData(userId: string, role: string) {
   });
 
   const notifications = notificationsRaw.map((n: any) => {
-    const out: any = { ...n, id: String(n._id) };
+    const out: any = { ...n, id: n.id || String(n._id) };
     delete out._id;
     delete out.__v;
-    if (out.link && out.link._id) {
-      out.link.id = String(out.link._id);
-      delete out.link._id;
+    if (out.link && (out.link as any)._id) {
+      (out.link as any).id = String((out.link as any)._id);
+      delete (out.link as any)._id;
     }
     return out;
   });

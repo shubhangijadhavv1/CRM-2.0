@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import mongoose from 'mongoose';
 import { requireAuth, type AuthedRequest } from '../middleware/auth.js';
 import { requireDb } from '../middleware/db.js';
 import { AttendanceModel } from '../models/Attendance.js';
@@ -22,16 +23,8 @@ function getClientIp(req: any) {
   return ip.startsWith('::ffff:') ? ip.slice(7) : ip;
 }
 
-async function loadBranchConfig(branchKey: string) {
-  const k = String(branchKey || 'Main').trim() || 'Main';
-  return BranchConfigModel.findOne({ $or: [{ id: k }, { name: k }] }).lean();
-}
-
-// ... (other functions) ...
-
 function isAllowedDailyStatusTransition(from: string | undefined, to: string | undefined, payload?: any): boolean {
   if (!from || !to || from === to) return true;
-  // Allow re-check-in: checked-out → checked-in only when sessions array is being extended
   if (from === 'checked-out') {
     if (to === 'checked-in' && payload?.sessions && Array.isArray(payload.sessions) && payload.sessions.length > 1) return true;
     return false;
@@ -61,18 +54,15 @@ attendanceRouter.get('/', async (req: AuthedRequest, res, next) => {
   }
 });
 
-// Upsert by id (client-friendly)
 attendanceRouter.post('/', async (req: AuthedRequest, res, next) => {
   try {
     const record = req.body ?? {};
     if (!record.id) return res.status(400).json({ error: 'id is required' });
 
-    // Team can only write their own records
     if (req.user?.role === 'team') {
       record.userId = req.user.id;
     }
 
-    // 1. Guard: Ensure the ID matches the date in the database (prevent cross-day drift)
     const existingById = await AttendanceModel.findOne({ id: record.id }).lean() as any;
     if (existingById && existingById.date !== record.date) {
       return res.status(400).json({
@@ -80,21 +70,17 @@ attendanceRouter.post('/', async (req: AuthedRequest, res, next) => {
       });
     }
 
-    // 2. Guard: Ensure the primary checkInTime matches the record date
     if (record.checkInTime && !record.checkInTime.startsWith(record.date)) {
       return res.status(400).json({
         error: `Fatal date mismatch: checkInTime (${record.checkInTime}) does not match record date (${record.date}).`
       });
     }
 
-    // 3. Resolve Master Record (today's canonical record for this user)
     if (record.userId && record.date && record.checkOutTime == null) {
       const canonical = await attendanceUtils.resolveMasterRecord(String(record.userId), String(record.date));
       if (canonical && canonical.id !== record.id) {
-        // Force the client to use the existing canonical ID for today
         record.id = canonical.id;
         record.checkInTime = canonical.checkInTime || record.checkInTime;
-        // 1. Merge and Deduplicate Sessions by merging overlaps
         const canonicalSessions = Array.isArray(canonical.sessions) ? canonical.sessions : [];
         const recordsessions = Array.isArray(record.sessions) ? record.sessions : [];
 
@@ -109,7 +95,7 @@ attendanceRouter.post('/', async (req: AuthedRequest, res, next) => {
         const merged: any[] = [];
         allSessions.forEach(curr => {
           const prev = merged[merged.length - 1];
-          if (!prev || curr.in > prev.out + 60000) { // 1 min gap allowed
+          if (!prev || curr.in > prev.out + 60000) { 
             merged.push(curr);
           } else {
             prev.out = Math.max(prev.out, curr.out);
@@ -120,7 +106,6 @@ attendanceRouter.post('/', async (req: AuthedRequest, res, next) => {
           checkOut: (m.out >= Date.now() - 30000) ? null : new Date(m.out).toISOString()
         }));
 
-        // 2. Merge and Deduplicate Breaks
         const canonicalBreaks = Array.isArray(canonical.breaks) ? canonical.breaks : [];
         const incomingBreaks = Array.isArray(record.breaks) ? record.breaks : [];
         const breakMap = new Map();
@@ -135,7 +120,6 @@ attendanceRouter.post('/', async (req: AuthedRequest, res, next) => {
         });
         record.breaks = Array.from(breakMap.values()).sort((a, b) => a.startTime.localeCompare(b.startTime));
 
-        // 3. Merge and Deduplicate Idle Intervals
         const canonicalIdle = Array.isArray(canonical.idleIntervals) ? canonical.idleIntervals : [];
         const incomingIdle = Array.isArray(record.idleIntervals) ? record.idleIntervals : [];
         const idleMap = new Map();
@@ -155,15 +139,11 @@ attendanceRouter.post('/', async (req: AuthedRequest, res, next) => {
       }
     }
 
-    // 4. Final session scrubbing: NEVER allow yesterday's sessions in today's record
     if (Array.isArray(record.sessions)) {
       record.sessions = record.sessions.filter((s: any) => s.checkIn && s.checkIn.startsWith(record.date));
     }
 
-    // --- Server-authoritative late-mark (branch id OR name; office offset via BRANCH_UTC_OFFSET_MINUTES) ---
     if (record.date && record.userId && record.checkInTime) {
-      const checkInMs = new Date(record.checkInTime).getTime();
-      if (!Number.isFinite(checkInMs)) return res.status(400).json({ error: 'Invalid checkInTime' });
       const branchKey = record.branch || 'Main';
       const computed = await attendanceUtils.computeIsLateForRecord({
         attendanceId: record.id,
@@ -175,8 +155,6 @@ attendanceRouter.post('/', async (req: AuthedRequest, res, next) => {
       if (computed !== undefined) record.isLate = computed;
     }
 
-    // Prefer server IP when not provided by client
-    // Always record the real client IP for staff actions.
     if (req.user?.role === 'team') {
       record.ipAddress = getClientIp(req);
     } else if (!record.ipAddress) {
@@ -188,13 +166,15 @@ attendanceRouter.post('/', async (req: AuthedRequest, res, next) => {
       record.dailyStatus === 'checked-in' &&
       Array.isArray(record.sessions) && record.sessions.length > 1;
     if (existing?.checkOutTime && record.checkOutTime == null && !isReCheckIn) {
-      return res.status(409).json({ error: 'Cannot reopen a checked-out session through attendance upsert.' });
+      const out: any = { ...existing };
+      delete out._id;
+      delete out.__v;
+      return res.status(200).json({ attendanceRecord: out });
     }
     if (existing?.dailyStatus && record.dailyStatus && !isAllowedDailyStatusTransition(existing.dailyStatus, record.dailyStatus, record)) {
       record.dailyStatus = existing.dailyStatus;
     }
     if (existing && !existing.checkOutTime && record.checkOutTime == null) {
-      // Protect cumulative same-day totals from stale client snapshots that send smaller values.
       record.idleMinutes = Math.max(Number(existing.idleMinutes || 0), Number(record.idleMinutes || 0));
       record.totalWorkMinutes = Math.max(Number(existing.totalWorkMinutes || 0), Number(record.totalWorkMinutes || 0));
     }
@@ -210,7 +190,6 @@ attendanceRouter.post('/', async (req: AuthedRequest, res, next) => {
     delete out.__v;
     emitInvalidate('attendance');
 
-    // Notify admins when a team member checks in late
     if (record.isLate && record.dailyStatus !== 'checked-out' && req.user?.role === 'team') {
       const userName = req.user?.id ? (await UserModel.findById(req.user.id).select('name').lean())?.name : 'Employee';
       const admins = await UserModel.find({ role: { $in: ['admin', 'super-admin'] }, status: 'active' }).select('_id').lean();
@@ -230,11 +209,6 @@ attendanceRouter.post('/', async (req: AuthedRequest, res, next) => {
   }
 });
 
-/**
- * POST /api/attendance/:id/break/start
- * Body: { type: "lunch" | "tea" }
- * Atomically adds a break entry and sets dailyStatus.
- */
 attendanceRouter.post('/:id/break/start', async (req: AuthedRequest, res, next) => {
   try {
     const { id } = req.params;
@@ -244,8 +218,28 @@ attendanceRouter.post('/:id/break/start', async (req: AuthedRequest, res, next) 
       return res.status(400).json({ error: 'type must be "lunch" or "tea"' });
     }
 
-    const existing = await AttendanceModel.findOne({ id }).lean() as any;
-    if (!existing) return res.status(404).json({ error: 'Attendance record not found' });
+    let existing = await AttendanceModel.findOne({
+      $or: [
+        { id },
+        ...(id.length === 24 && mongoose.Types.ObjectId.isValid(id) ? [{ _id: new mongoose.Types.ObjectId(id) }] : [])
+      ]
+    }).lean() as any;
+
+    if (!existing && req.user) {
+      existing = await attendanceUtils.resolveMasterRecord(req.user.id, attendanceUtils.getLocalTodayStr());
+    }
+
+    if (!existing) {
+      return res.status(404).json({ 
+        error: 'Attendance record not found',
+        debug: { 
+          reason: 'Initial lookup + resolveMasterRecord failed',
+          id, 
+          userId: req.user?.id, 
+          today: attendanceUtils.getLocalTodayStr() 
+        }
+      });
+    }
 
     if (req.user?.role === 'team' && existing.userId !== req.user.id) {
       return res.status(403).json({ error: 'Forbidden' });
@@ -266,7 +260,7 @@ attendanceRouter.post('/:id/break/start', async (req: AuthedRequest, res, next) 
     const newStatus = type === 'lunch' ? 'lunch-break' : 'tea-break';
 
     const updated = await AttendanceModel.findOneAndUpdate(
-      { id },
+      { _id: existing._id },
       {
         $set: { dailyStatus: newStatus },
         $push: { breaks: newBreak },
@@ -285,16 +279,32 @@ attendanceRouter.post('/:id/break/start', async (req: AuthedRequest, res, next) 
   }
 });
 
-/**
- * POST /api/attendance/:id/break/end
- * Closes the open break entry and sets dailyStatus back to checked-in.
- */
 attendanceRouter.post('/:id/break/end', async (req: AuthedRequest, res, next) => {
   try {
     const { id } = req.params;
 
-    const existing = await AttendanceModel.findOne({ id }).lean() as any;
-    if (!existing) return res.status(404).json({ error: 'Attendance record not found' });
+    let existing = await AttendanceModel.findOne({
+      $or: [
+        { id },
+        ...(id.length === 24 && mongoose.Types.ObjectId.isValid(id) ? [{ _id: new mongoose.Types.ObjectId(id) }] : [])
+      ]
+    }).lean() as any;
+
+    if (!existing && req.user) {
+      existing = await attendanceUtils.resolveMasterRecord(req.user.id, attendanceUtils.getLocalTodayStr());
+    }
+
+    if (!existing) {
+      return res.status(404).json({ 
+        error: 'Attendance record not found',
+        debug: { 
+          reason: 'Initial lookup + resolveMasterRecord failed',
+          id, 
+          userId: req.user?.id, 
+          today: attendanceUtils.getLocalTodayStr() 
+        }
+      });
+    }
 
     if (req.user?.role === 'team' && existing.userId !== req.user.id) {
       return res.status(403).json({ error: 'Forbidden' });
@@ -307,15 +317,13 @@ attendanceRouter.post('/:id/break/end', async (req: AuthedRequest, res, next) =>
     const nowIso = new Date().toISOString();
 
     const updated = await AttendanceModel.findOneAndUpdate(
-      { id },
+      { _id: existing._id },
       {
-        $set: {
-          dailyStatus: 'checked-in',
-          'breaks.$[openBreak].endTime': nowIso,
-        },
+        $set: { dailyStatus: 'checked-in' },
+        'breaks.$[elem].endTime': nowIso,
       },
       {
-        arrayFilters: [{ 'openBreak.endTime': null }],
+        arrayFilters: [{ 'elem.endTime': null }],
         new: true,
       }
     ).lean() as any;
@@ -331,11 +339,6 @@ attendanceRouter.post('/:id/break/end', async (req: AuthedRequest, res, next) =>
   }
 });
 
-/**
- * GET /api/attendance/my-summary
- * Returns today's computed time breakdown for the logged-in user.
- * Mirrors computeLiveWorkplaceDisplay() in utils/timeCalc.ts exactly.
- */
 attendanceRouter.get('/my-summary', async (req: AuthedRequest, res, next) => {
   try {
     const userId = req.user!.id;
@@ -349,14 +352,13 @@ attendanceRouter.get('/my-summary', async (req: AuthedRequest, res, next) => {
 
     const branchKey = String(rec.branch || 'Main');
     const bc = await BranchConfigModel.findOne({ $or: [{ id: branchKey }, { name: branchKey }] }).lean() as any;
-    // Sanitize in case of legacy drift in DB
+    
     const sanitizedRec = {
       ...rec,
       idleMinutes: (rec.checkInTime && rec.checkInTime.startsWith(today)) ? rec.idleMinutes : 0,
       totalWorkMinutes: (rec.checkInTime && rec.checkInTime.startsWith(today)) ? rec.totalWorkMinutes : 0,
     };
 
-    // Auto-repair: If record has checkInTime but NO sessions, re-create the session to fix the display.
     if ((!rec.sessions || rec.sessions.length === 0) && rec.checkInTime && rec.checkInTime.startsWith(today)) {
       const repairedSessions = [{
         checkIn: rec.checkInTime,
@@ -372,13 +374,10 @@ attendanceRouter.get('/my-summary', async (req: AuthedRequest, res, next) => {
       nowMs: now,
     });
 
-    // Final safety: if summary is missing core fields or is zero despite being checked in, 
-    // calculate a basic 'wall-clock' shift to ensure the agent shows SOMETHING.
     if (sanitizedRec.checkInTime && sanitizedRec.checkInTime.startsWith(today)) {
       const checkInMs = new Date(sanitizedRec.checkInTime).getTime();
       const wallShiftMs = Math.max(0, now - checkInMs);
       if ((summary.shiftMs || 0) < 60000) summary.shiftMs = wallShiftMs;
-      // If workMs is 0, estimate it as shiftMs - idle (roughly)
       if ((summary.workMs || 0) < 60000) summary.workMs = Math.max(0, wallShiftMs - (summary.idleMs || 0));
     }
 
@@ -393,7 +392,17 @@ attendanceRouter.get('/my-summary', async (req: AuthedRequest, res, next) => {
 attendanceRouter.get('/:id', async (req: AuthedRequest, res, next) => {
   try {
     const { id } = req.params;
-    const doc = await AttendanceModel.findOne({ id }).lean() as any;
+    let doc = await AttendanceModel.findOne({
+      $or: [
+        { id },
+        ...(id.length === 24 && mongoose.Types.ObjectId.isValid(id) ? [{ _id: new mongoose.Types.ObjectId(id) }] : [])
+      ]
+    }).lean() as any;
+
+    if (!doc && req.user) {
+      doc = await attendanceUtils.resolveMasterRecord(req.user.id, attendanceUtils.getLocalTodayStr());
+    }
+
     if (!doc) return res.status(404).json({ error: 'Attendance record not found' });
     if (req.user?.role === 'team' && doc.userId !== req.user.id) {
       return res.status(403).json({ error: 'Forbidden' });
@@ -412,23 +421,34 @@ attendanceRouter.put('/:id', async (req: AuthedRequest, res, next) => {
     const id = req.params.id;
     const patch = req.body ?? {};
 
-    if (req.user?.role === 'team') {
-      const existing = await AttendanceModel.findOne({ id }).lean();
-      if (!existing) return res.status(404).json({ error: 'Attendance record not found' });
-      if (existing.userId !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+    let existingFull = await AttendanceModel.findOne({
+      $or: [
+        { id },
+        ...(id.length === 24 && mongoose.Types.ObjectId.isValid(id) ? [{ _id: new mongoose.Types.ObjectId(id) }] : [])
+      ]
+    }).lean();
+
+    if (!existingFull && req.user) {
+      existingFull = await attendanceUtils.resolveMasterRecord(req.user.id, attendanceUtils.getLocalTodayStr());
     }
 
-    const existingFull = await AttendanceModel.findOne({ id }).lean();
     if (!existingFull) return res.status(404).json({ error: 'Attendance record not found' });
+    
+    if (req.user?.role === 'team' && (existingFull as any).userId !== req.user.id) {
+        return res.status(403).json({ error: 'Forbidden' });
+    }
+
     if ((existingFull as any).checkOutTime && patch.checkOutTime == null) {
-      return res.status(409).json({ error: 'Cannot reopen a checked-out session.' });
+      const out: any = { ...existingFull };
+      delete out._id;
+      delete out.__v;
+      return res.json({ attendanceRecord: out });
     }
     const merged: any = { ...(existingFull as any), ...patch };
     if (patch.dailyStatus && !isAllowedDailyStatusTransition((existingFull as any).dailyStatus, patch.dailyStatus)) {
       patch.dailyStatus = (existingFull as any).dailyStatus;
     }
     if (!(existingFull as any).checkOutTime && patch.checkOutTime == null) {
-      // Do not allow stale updates to reduce running daily totals mid-session.
       if (patch.idleMinutes != null) {
         patch.idleMinutes = Math.max(Number((existingFull as any).idleMinutes || 0), Number(patch.idleMinutes || 0));
       }
@@ -443,7 +463,7 @@ attendanceRouter.put('/:id', async (req: AuthedRequest, res, next) => {
       (patch.checkInTime != null || patch.date != null || patch.branch != null || patch.userId != null)
     ) {
       const computed = await attendanceUtils.computeIsLateForRecord({
-        attendanceId: id,
+        attendanceId: (existingFull as any).id,
         date: merged.date,
         userId: merged.userId,
         checkInTime: merged.checkInTime,
@@ -452,19 +472,15 @@ attendanceRouter.put('/:id', async (req: AuthedRequest, res, next) => {
       if (computed !== undefined) patch.isLate = computed;
     }
 
-    const updated = await AttendanceModel.findOneAndUpdate({ id }, { $set: patch }, { new: true }).lean();
+    const updated = await AttendanceModel.findOneAndUpdate({ _id: (existingFull as any)._id }, { $set: patch }, { new: true }).lean();
     if (!updated) return res.status(404).json({ error: 'Attendance record not found' });
     const out: any = { ...updated };
     delete out._id;
     delete out.__v;
 
-    if ((out as any).userId && (out as any).date && !out.checkOutTime) {
-      await resolveCanonicalOpenSession(String((out as any).userId), String((out as any).date));
-    }
     emitInvalidate('attendance');
     return res.json({ attendanceRecord: out });
   } catch (e) {
     return next(e);
   }
 });
-
