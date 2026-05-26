@@ -139,7 +139,10 @@ activityRouter.post('/heartbeat', async (req: AuthedRequest, res, next) => {
     const currentAtt = await attendanceUtils.resolveMasterRecord(req.user!.id, todayStr);
     const isClockedIn = !!currentAtt && currentAtt.dailyStatus !== "checked-out";
 
-    if (isClockedIn) {
+    const isBreakMode = String(currentAtt?.dailyStatus || '').includes('break');
+    //  const isBreakMode = String((attForAlert as any)?.dailyStatus || '').includes('break');
+
+    if (isClockedIn && !isBreakMode) {
       await ActivityLogModel.create({
         userId: req.user!.id,
         at: new Date(),
@@ -150,7 +153,7 @@ activityRouter.post('/heartbeat', async (req: AuthedRequest, res, next) => {
     const attForAlert = await attendanceUtils.resolveCanonicalOpenSession(req.user!.id, attendanceUtils.getLocalTodayStr());
     const userRole = String((updated as any)?.role || '');
     const isAdminRole = userRole === 'super-admin' || userRole === 'admin';
-    const isBreakMode = String((attForAlert as any)?.dailyStatus || '').includes('break');
+   
     const canSendIdleAlert = Boolean(attForAlert) && !isAdminRole && !isBreakMode;
 
     if (!serverIsIdle) {
@@ -262,29 +265,33 @@ activityRouter.post('/heartbeat', async (req: AuthedRequest, res, next) => {
           const effectiveIdleStart = forceNow ? new Date().toISOString() : idleStartIso;
           idleIntervals.push({ startTime: effectiveIdleStart, endTime: null, deducted: false });
         }
-        const updatedAtt = await AttendanceModel.findOneAndUpdate(
-          { id: att.id },
-          { $set: { idleIntervals, dailyStatus: 'idle' } },
-          { new: true }
-        );
-        if (updatedAtt) {
-          const branchId = String((updatedAtt as any).branch || '');
-          const branchConfig = branchId ? await BranchConfigModel.findOne({ $or: [{ id: branchId }, { name: branchId }] }).lean() : null;
-          const summary = computeAttendanceSummary({
-            record: updatedAtt as any,
-            branchConfig: branchConfig || undefined,
-            nowMs: Date.now(),
-          });
-          await AttendanceModel.findOneAndUpdate(
+        const openBreakInHb = (att.breaks || []).find((b: any) => !b.endTime);
+        const isBreak = !!openBreakInHb || (att.dailyStatus as string) === 'lunch-break' || (att.dailyStatus as string) === 'tea-break';
+        if (!isBreak) {
+          const updatedAtt = await AttendanceModel.findOneAndUpdate(
             { id: att.id },
-            {
-              $set: {
-                totalWorkMinutes: Math.max(Number((updatedAtt as any).totalWorkMinutes || 0), Math.floor(summary.workMs / 60000)),
-                idleMinutes: Math.max(Number((updatedAtt as any).idleMinutes || 0), Math.floor(summary.idleMs / 60000)),
-              }
-            },
-            { new: false }
+            { $set: { idleIntervals, dailyStatus: 'idle' } },
+            { new: true }
           );
+          if (updatedAtt) {
+            const branchId = String((updatedAtt as any).branch || '');
+            const branchConfig = branchId ? await BranchConfigModel.findOne({ $or: [{ id: branchId }, { name: branchId }] }).lean() : null;
+            const summary = computeAttendanceSummary({
+              record: updatedAtt as any,
+              branchConfig: branchConfig || undefined,
+              nowMs: Date.now(),
+            });
+            await AttendanceModel.findOneAndUpdate(
+              { id: att.id },
+              {
+                $set: {
+                  totalWorkMinutes: Math.max(Number((updatedAtt as any).totalWorkMinutes || 0), Math.floor(summary.workMs / 60000)),
+                  idleMinutes: Math.max(Number((updatedAtt as any).idleMinutes || 0), Math.floor(summary.idleMs / 60000)),
+                }
+              },
+              { new: false }
+            );
+          }
         }
       } else {
         // Activity detected — close ALL open idle intervals (not just index 0) to prevent
@@ -309,29 +316,33 @@ activityRouter.post('/heartbeat', async (req: AuthedRequest, res, next) => {
           updatePatch.idleIntervals = idleIntervals;
           updatePatch.idleMinutes = Math.floor(recomputedIdleMs / 60000);
         }
-        const updatedAtt = await AttendanceModel.findOneAndUpdate(
-          { id: att.id },
-          { $set: updatePatch },
-          { new: true }
-        );
-        if (updatedAtt) {
-          const branchId = String((updatedAtt as any).branch || '');
-          const branchConfig = branchId ? await BranchConfigModel.findOne({ $or: [{ id: branchId }, { name: branchId }] }).lean() : null;
-          const summary = computeAttendanceSummary({
-            record: updatedAtt as any,
-            branchConfig: branchConfig || undefined,
-            nowMs: Date.now(),
-          });
-          await AttendanceModel.findOneAndUpdate(
+        const openBreakInHb = (att.breaks || []).find((b: any) => !b.endTime);
+        const isBreak = !!openBreakInHb || (att.dailyStatus as string) === 'lunch-break' || (att.dailyStatus as string) === 'tea-break';
+        if (!isBreak) {
+          const updatedAtt = await AttendanceModel.findOneAndUpdate(
             { id: att.id },
-            {
-              $set: {
-                totalWorkMinutes: Math.max(Number((updatedAtt as any).totalWorkMinutes || 0), Math.floor(summary.workMs / 60000)),
-                idleMinutes: Math.max(Number((updatedAtt as any).idleMinutes || 0), Math.floor(summary.idleMs / 60000)),
-              }
-            },
-            { new: false }
+            { $set: updatePatch },
+            { new: true }
           );
+          if (updatedAtt) {
+            const branchId = String((updatedAtt as any).branch || '');
+            const branchConfig = branchId ? await BranchConfigModel.findOne({ $or: [{ id: branchId }, { name: branchId }] }).lean() : null;
+            const summary = computeAttendanceSummary({
+              record: updatedAtt as any,
+              branchConfig: branchConfig || undefined,
+              nowMs: Date.now(),
+            });
+            await AttendanceModel.findOneAndUpdate(
+              { id: att.id },
+              {
+                $set: {
+                  totalWorkMinutes: Math.max(Number((updatedAtt as any).totalWorkMinutes || 0), Math.floor(summary.workMs / 60000)),
+                  idleMinutes: Math.max(Number((updatedAtt as any).idleMinutes || 0), Math.floor(summary.idleMs / 60000)),
+                }
+              },
+              { new: false }
+            );
+          }
         }
       }
     }

@@ -76,6 +76,7 @@ function computeBreakTotals(
   lunchLimitMinutes: number,
   teaLimitMinutes: number,
   isOnBreak: boolean = false,
+  currentStatus: string = '',
 ): { lunchWallMs: number; teaWallMs: number; allowedBreakMs: number; excessBreakMs: number } {
   let lunchWallMs = 0;
   let teaWallMs = 0;
@@ -84,7 +85,8 @@ function computeBreakTotals(
 
   const rawBreaks = (breaks || []).filter(b => b.startTime).map(b => {
     const bStart = new Date(b.startTime).getTime();
-    const bEnd = b.endTime ? new Date(b.endTime).getTime() : (isOnBreak ? nowMs : bStart);
+    const isThisBreakActive = !b.endTime && isOnBreak && currentStatus === (b.type === 'lunch' ? 'lunch-break' : 'tea-break');
+    const bEnd = b.endTime ? new Date(b.endTime).getTime() : (isThisBreakActive ? nowMs : bStart);
     return { type: b.type, start: bStart, end: bEnd };
   }).filter(b => b.end > b.start).sort((a, b) => a.start - b.start);
 
@@ -296,7 +298,7 @@ export function computeTotalSessionMs(
 }
 
 export function computeAttendanceSummary(params: {
-  record: Pick<AttendanceDoc, 'checkInTime' | 'checkOutTime' | 'dailyStatus' | 'status' | 'breaks' | 'idleIntervals' | 'idleMinutes' | 'totalWorkMinutes' | 'branch'>;
+  record: Pick<AttendanceDoc, 'checkInTime' | 'checkOutTime' | 'dailyStatus' | 'status' | 'breaks' | 'idleIntervals' | 'idleMinutes' | 'totalWorkMinutes' | 'branch' | 'sessions'>;
   branchConfig?: Partial<BranchConfigDoc> | null;
   nowMs?: number;
 }): AttendanceSummary {
@@ -328,7 +330,7 @@ export function computeAttendanceSummary(params: {
   const lunchLimit = Math.max(0, Number(cfg.lunchTimeLimitMinutes) || DEFAULT_CONFIG.lunchTimeLimitMinutes);
   const teaLimit = Math.max(0, Number(cfg.teaBreakTimeLimitMinutes) || DEFAULT_CONFIG.teaBreakTimeLimitMinutes);
   const isOnBreak = params.record.dailyStatus === 'lunch-break' || params.record.dailyStatus === 'tea-break';
-  const breakTotals = computeBreakTotals(params.record.breaks, endRefMs, lunchLimit, teaLimit, isOnBreak);
+  const breakTotals = computeBreakTotals(params.record.breaks, endRefMs, lunchLimit, teaLimit, isOnBreak, params.record.dailyStatus || '');
   // shiftMs = total time from first check-in to now (wall clock including gaps between sessions)
   const shiftMs = Math.max(0, endRefMs - checkInMs);
   // totalSessionMs = actual time spent clocked in (sum of all sessions, excludes gaps between sessions)
@@ -380,7 +382,7 @@ export function computeAttendanceSummary(params: {
   }
   const frozenSessionMs = isOnBreak ? computeTotalSessionMs(params.record as any, workRefMs) : totalSessionMs;
   const frozenBreakTotals = isOnBreak
-    ? computeBreakTotals(params.record.breaks, workRefMs, lunchLimit, teaLimit)
+    ? computeBreakTotals(params.record.breaks, workRefMs, lunchLimit, teaLimit, false, '')
     : breakTotals;
   const idleMs = computeIdleMs(params.record, idleRefMs);
   const computedWorkMs = Math.max(0, frozenSessionMs - frozenBreakTotals.allowedBreakMs - idleMs - frozenBreakTotals.excessBreakMs);

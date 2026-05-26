@@ -28,7 +28,7 @@ export const resolveMasterRecord = async (userId: string, date: string): Promise
 
   // Multiple records exist for the same day — merge them into one canonical view.
   // We use the oldest record for check-in and the most recently updated for status fields.
-  const latest = [...todayRows].sort((a, b) => new Date(b.updatedAt || 0).getTime() - new Date(a.updatedAt || 0).getTime())[0];
+  const latest = [...todayRows].sort((a: any, b: any) => new Date(b.updatedAt || 0).getTime() - new Date(a.updatedAt || 0).getTime())[0];
   const first = todayRows[0];
 
   const sessions = todayRows.flatMap(r => (r as any).sessions || []);

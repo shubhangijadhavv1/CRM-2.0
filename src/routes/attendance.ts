@@ -32,7 +32,9 @@ function isAllowedDailyStatusTransition(from: string | undefined, to: string | u
   if (from === 'checked-in') return ['idle', 'lunch-break', 'tea-break', 'checked-out', 'background'].includes(to);
   if (from === 'idle') return ['checked-in', 'checked-out', 'background'].includes(to);
   if (from === 'background') return ['checked-in', 'idle', 'checked-out'].includes(to);
-  if (from === 'lunch-break' || from === 'tea-break') return ['checked-in', 'checked-out'].includes(to);
+  // Breaks can ONLY be ended by the explicit break/end route (which bypasses this check) 
+  // or by a full checkout. This prevents heartbeats from accidentally ending breaks.
+  if (from === 'lunch-break' || from === 'tea-break') return ['checked-out'].includes(to);
   return false;
 }
 
@@ -78,9 +80,11 @@ attendanceRouter.post('/', async (req: AuthedRequest, res, next) => {
 
     if (record.userId && record.date && record.checkOutTime == null) {
       const canonical = await attendanceUtils.resolveMasterRecord(String(record.userId), String(record.date));
-      if (canonical && canonical.id !== record.id) {
-        record.id = canonical.id;
-        record.checkInTime = canonical.checkInTime || record.checkInTime;
+      if (canonical) {
+        if (canonical.id !== record.id) {
+          record.id = canonical.id;
+          record.checkInTime = canonical.checkInTime || record.checkInTime;
+        }
         const canonicalSessions = Array.isArray(canonical.sessions) ? canonical.sessions : [];
         const recordsessions = Array.isArray(record.sessions) ? record.sessions : [];
 
@@ -95,7 +99,7 @@ attendanceRouter.post('/', async (req: AuthedRequest, res, next) => {
         const merged: any[] = [];
         allSessions.forEach(curr => {
           const prev = merged[merged.length - 1];
-          if (!prev || curr.in > prev.out + 60000) { 
+          if (!prev || curr.in > prev.out + 60000) {
             merged.push(curr);
           } else {
             prev.out = Math.max(prev.out, curr.out);
@@ -174,6 +178,11 @@ attendanceRouter.post('/', async (req: AuthedRequest, res, next) => {
     if (existing?.dailyStatus && record.dailyStatus && !isAllowedDailyStatusTransition(existing.dailyStatus, record.dailyStatus, record)) {
       record.dailyStatus = existing.dailyStatus;
     }
+    // Force break status if an open break exists
+    const openBreakInPost = (existing?.breaks || []).find((b: any) => !b.endTime);
+    if (openBreakInPost && record.dailyStatus !== 'checked-out') {
+      record.dailyStatus = openBreakInPost.type === 'lunch' ? 'lunch-break' : 'tea-break';
+    }
     if (existing && !existing.checkOutTime && record.checkOutTime == null) {
       record.idleMinutes = Math.max(Number(existing.idleMinutes || 0), Number(record.idleMinutes || 0));
       record.totalWorkMinutes = Math.max(Number(existing.totalWorkMinutes || 0), Number(record.totalWorkMinutes || 0));
@@ -230,13 +239,13 @@ attendanceRouter.post('/:id/break/start', async (req: AuthedRequest, res, next) 
     }
 
     if (!existing) {
-      return res.status(404).json({ 
+      return res.status(404).json({
         error: 'Attendance record not found',
-        debug: { 
+        debug: {
           reason: 'Initial lookup + resolveMasterRecord failed',
-          id, 
-          userId: req.user?.id, 
-          today: attendanceUtils.getLocalTodayStr() 
+          id,
+          userId: req.user?.id,
+          today: attendanceUtils.getLocalTodayStr()
         }
       });
     }
@@ -282,6 +291,7 @@ attendanceRouter.post('/:id/break/start', async (req: AuthedRequest, res, next) 
 attendanceRouter.post('/:id/break/end', async (req: AuthedRequest, res, next) => {
   try {
     const { id } = req.params;
+    // console.log("id", id, "req.user!.id", req.user!.id)
 
     let existing = await AttendanceModel.findOne({
       $or: [
@@ -290,47 +300,56 @@ attendanceRouter.post('/:id/break/end', async (req: AuthedRequest, res, next) =>
       ]
     }).lean() as any;
 
-    if (!existing && req.user) {
-      existing = await attendanceUtils.resolveMasterRecord(req.user.id, attendanceUtils.getLocalTodayStr());
-    }
+    // Aggressively search for any open break for this user or this specific record ID.
+    // Removing the date constraint to handle potential timezone shifts or "stuck" breaks from earlier.
+    const openRecords = await AttendanceModel.find({
+      $or: [
+        { id: req.params.id },
+        { userId: req.user!.id }
+      ],
+      'breaks.endTime': null
+    }).sort({ createdAt: -1 }).lean();
 
-    if (!existing) {
-      return res.status(404).json({ 
-        error: 'Attendance record not found',
-        debug: { 
-          reason: 'Initial lookup + resolveMasterRecord failed',
-          id, 
-          userId: req.user?.id, 
-          today: attendanceUtils.getLocalTodayStr() 
-        }
-      });
-    }
-
-    if (req.user?.role === 'team' && existing.userId !== req.user.id) {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
-
-    if (existing.dailyStatus !== 'lunch-break' && existing.dailyStatus !== 'tea-break') {
-      return res.status(409).json({ error: `Not currently on break (status: ${existing.dailyStatus})` });
+    if (openRecords.length === 0) {
+      // If no open break found, check if we should allow a "soft" fix
+      const today = attendanceUtils.getLocalTodayStr();
+      const master = await attendanceUtils.resolveMasterRecord(req.user!.id, today);
+      if (!master || (master.dailyStatus !== 'lunch-break' && master.dailyStatus !== 'tea-break')) {
+        return res.status(409).json({ error: `No active break found to end.` });
+      }
+      // If status says on break but no record, just fix the status
+      await AttendanceModel.updateMany({ userId: req.user!.id, date: today }, { $set: { dailyStatus: 'checked-in' } });
+      return res.status(200).json({ message: 'Status fixed' });
     }
 
     const nowIso = new Date().toISOString();
 
-    const updated = await AttendanceModel.findOneAndUpdate(
-      { _id: existing._id },
-      {
-        $set: { dailyStatus: 'checked-in' },
-        'breaks.$[elem].endTime': nowIso,
-      },
-      {
-        arrayFilters: [{ 'elem.endTime': null }],
-        new: true,
-      }
-    ).lean() as any;
+    // Close ALL open breaks across all records for this user to be safe.
+    // NOTE: every change must live under $set — mixing a bare field path
+    // ('breaks.$[elem].endTime') with the $set operator makes MongoDB reject the
+    // whole update, which is why End Break silently failed and the break stayed open.
+    for (const rec of openRecords) {
+      await AttendanceModel.updateOne(
+        { _id: (rec as any)._id },
+        {
+          $set: {
+            dailyStatus: 'checked-in',
+            'breaks.$[elem].endTime': nowIso,
+          },
+        },
+        {
+          arrayFilters: [{ 'elem.endTime': null }],
+        }
+      );
+    }
 
-    const out: any = { ...updated };
-    delete out._id;
-    delete out.__v;
+    // Refresh master record to return to UI
+    const updatedMaster = await attendanceUtils.resolveMasterRecord(req.user!.id, attendanceUtils.getLocalTodayStr());
+    const out: any = { ...updatedMaster };
+    if (out) {
+      delete out._id;
+      delete out.__v;
+    }
     emitInvalidate('attendance');
 
     return res.status(200).json({ attendanceRecord: out });
@@ -352,7 +371,7 @@ attendanceRouter.get('/my-summary', async (req: AuthedRequest, res, next) => {
 
     const branchKey = String(rec.branch || 'Main');
     const bc = await BranchConfigModel.findOne({ $or: [{ id: branchKey }, { name: branchKey }] }).lean() as any;
-    
+
     const sanitizedRec = {
       ...rec,
       idleMinutes: (rec.checkInTime && rec.checkInTime.startsWith(today)) ? rec.idleMinutes : 0,
@@ -429,13 +448,13 @@ attendanceRouter.put('/:id', async (req: AuthedRequest, res, next) => {
     }).lean();
 
     if (!existingFull && req.user) {
-      existingFull = await attendanceUtils.resolveMasterRecord(req.user.id, attendanceUtils.getLocalTodayStr());
+      existingFull = (await attendanceUtils.resolveMasterRecord(req.user.id, attendanceUtils.getLocalTodayStr())) as any;
     }
 
     if (!existingFull) return res.status(404).json({ error: 'Attendance record not found' });
-    
+
     if (req.user?.role === 'team' && (existingFull as any).userId !== req.user.id) {
-        return res.status(403).json({ error: 'Forbidden' });
+      return res.status(403).json({ error: 'Forbidden' });
     }
 
     if ((existingFull as any).checkOutTime && patch.checkOutTime == null) {
@@ -447,6 +466,11 @@ attendanceRouter.put('/:id', async (req: AuthedRequest, res, next) => {
     const merged: any = { ...(existingFull as any), ...patch };
     if (patch.dailyStatus && !isAllowedDailyStatusTransition((existingFull as any).dailyStatus, patch.dailyStatus)) {
       patch.dailyStatus = (existingFull as any).dailyStatus;
+    }
+    // Force break status if an open break exists
+    const openBreakInPut = ((existingFull as any).breaks || []).find((b: any) => !b.endTime);
+    if (openBreakInPut && patch.dailyStatus !== 'checked-out') {
+      patch.dailyStatus = openBreakInPut.type === 'lunch' ? 'lunch-break' : 'tea-break';
     }
     if (!(existingFull as any).checkOutTime && patch.checkOutTime == null) {
       if (patch.idleMinutes != null) {
